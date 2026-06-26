@@ -1,0 +1,9 @@
+[submodule "refs/tiny386"]
+	path = refs/tiny386
+	url = https://github.com/hchunhui/tiny386.git
+[submodule "refs/seabios"]
+	path = refs/seabios
+	url = https://github.com/coreboot/seabios.git
+[submodule "refs/fdos-kernel"]
+	path = refs/fdos-kernel
+	url = https://github.com/FDOS/kernel.git
