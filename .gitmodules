@@ -7,3 +7,6 @@
 [submodule "refs/fdos-kernel"]
 	path = refs/fdos-kernel
 	url = https://github.com/FDOS/kernel.git
+[submodule "refs/emu8950"]
+	path = refs/emu8950
+	url = https://github.com/digital-sound-antiques/emu8950.git

@@ -1,0 +1,36 @@
+[sections:tiny386_cpu_iram]
+entries:
+    .tiny386_cpu_iram+
+
+[scheme:tiny386_cpu_iram]
+entries:
+    tiny386_cpu_iram -> iram0_text
+
+[mapping:tiny386hen_cpu_iram]
+archive: libmain.a
+entries:
+    i386 (tiny386_cpu_iram)
+
+[mapping:tiny386hen_external_bss_libc]
+archive: libc.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
+
+[mapping:tiny386hen_external_bss_main]
+archive: libmain.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
+
+[mapping:tiny386hen_external_bss_system]
+archive: libesp_system.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)
+
+[mapping:tiny386hen_external_bss_runtime]
+archive: libvfs.a
+entries:
+    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+        * (extram_bss)

@@ -1,0 +1,10 @@
+dependencies:
+  idf:
+    version: '>=5.2.0'
+  espressif/esp_lcd_ili9341:
+    version: ^1
+  espressif/usb_host_hid:
+    version: ^1.0.0
+    rules:
+    - if: idf_version >= 5.2
+    - if: "target not in [linux]"
