@@ -34,3 +34,27 @@ set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/main")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(tiny386hen_ili9341)
+
+set(LOCAL_RESOURCES_DIR "${TINY386HEN_ROOT}/assets")
+set(LOCAL_RESOURCES_IMAGE "${LOCAL_RESOURCES_DIR}/resources.bin")
+if(EXISTS "${LOCAL_RESOURCES_DIR}")
+    add_custom_command(
+        OUTPUT "${LOCAL_RESOURCES_IMAGE}"
+        COMMAND "${PYTHON}" "${TINY386HEN_ROOT}/script/pack-resources.py"
+                --assets "${LOCAL_RESOURCES_DIR}"
+                --output "${LOCAL_RESOURCES_IMAGE}"
+                --partition-size 0x100000
+        DEPENDS
+            "${TINY386HEN_ROOT}/script/pack-resources.py"
+            "${LOCAL_RESOURCES_DIR}/logo.bmp"
+            "${LOCAL_RESOURCES_DIR}/tiny386_boot_music_8bit.wav"
+        VERBATIM
+    )
+    add_custom_target(resources_bin ALL DEPENDS "${LOCAL_RESOURCES_IMAGE}")
+    esptool_py_flash_to_partition(flash resources "${LOCAL_RESOURCES_IMAGE}")
+    if(TARGET flash)
+        add_dependencies(flash resources_bin)
+    endif()
+else()
+    message(WARNING "Local resources directory not found: ${LOCAL_RESOURCES_DIR}")
+endif()

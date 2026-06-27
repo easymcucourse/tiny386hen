@@ -15,4 +15,10 @@ struct Globals {
 extern EventGroupHandle_t global_event_group;
 extern struct Globals globals;
 
+#define TINY386_EVENT_PC_READY     BIT0
+#define TINY386_EVENT_SPLASH_DONE  BIT1
+#define TINY386_EVENT_AUDIO_DONE   BIT2
+#define TINY386_EVENT_LOGO_READY   BIT3
+#define TINY386_EVENT_BOOT_SECTOR  BIT4
+
 #endif /* COMMON_H */

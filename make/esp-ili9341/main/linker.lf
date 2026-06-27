@@ -23,12 +23,6 @@ entries:
     if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
         * (extram_bss)
 
-[mapping:tiny386hen_external_bss_system]
-archive: libesp_system.a
-entries:
-    if ESP_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
-        * (extram_bss)
-
 [mapping:tiny386hen_external_bss_runtime]
 archive: libvfs.a
 entries:

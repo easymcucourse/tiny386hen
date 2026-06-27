@@ -4,6 +4,7 @@
 #include "freertos/task.h"
 #include "driver/i2s_std.h"
 #include "common.h"
+#include "startup_splash.h"
 
 static i2s_chan_handle_t                tx_chan;        // I2S tx channel handler
 void mixer_callback (void *opaque, uint8_t *stream, int free);
@@ -12,25 +13,101 @@ void mixer_callback (void *opaque, uint8_t *stream, int free);
 #define MIXER_BUF_LEN 128
 #endif
 
+#ifndef I2S_MIXER_VOLUME_DIV
+#define I2S_MIXER_VOLUME_DIV 5
+#endif
+
+#ifndef I2S_STARTUP_BEEP_HZ
+#define I2S_STARTUP_BEEP_HZ 880
+#endif
+
+#ifndef I2S_STARTUP_BEEP_MS
+#define I2S_STARTUP_BEEP_MS 90
+#endif
+
+#ifndef I2S_STARTUP_BEEP_VOLUME
+#define I2S_STARTUP_BEEP_VOLUME 2200
+#endif
+
+static void i2s_play_startup_beep(void)
+{
+	int16_t buf[MIXER_BUF_LEN];
+	const int sample_rate = 44100;
+	const int channels = 2;
+	const int frames_total = sample_rate * I2S_STARTUP_BEEP_MS / 1000;
+	const int frames_per_buf = MIXER_BUF_LEN / channels;
+	const int period = sample_rate / I2S_STARTUP_BEEP_HZ;
+	int frame = 0;
+
+	while (frame < frames_total) {
+		size_t bwritten;
+		int frames = frames_total - frame;
+		if (frames > frames_per_buf)
+			frames = frames_per_buf;
+
+		for (int i = 0; i < frames; i++) {
+			int phase = (frame + i) % period;
+			int sample = phase < (period / 2) ? I2S_STARTUP_BEEP_VOLUME : -I2S_STARTUP_BEEP_VOLUME;
+			buf[i * 2] = sample;
+			buf[i * 2 + 1] = sample;
+		}
+		i2s_channel_write(tx_chan, buf, frames * channels * sizeof(int16_t),
+				  &bwritten, portMAX_DELAY);
+		frame += frames;
+	}
+
+	memset(buf, 0, sizeof(buf));
+	for (int i = 0; i < 4; i++) {
+		size_t bwritten;
+		i2s_channel_write(tx_chan, buf, sizeof(buf), &bwritten, portMAX_DELAY);
+	}
+}
+
 static void i2s_task(void *arg)
 {
 	int16_t buf[MIXER_BUF_LEN];
 	int core_id = esp_cpu_get_core_id();
 	fprintf(stderr, "i2s runs on core %d\n", core_id);
 
+	esp_err_t ret = i2s_channel_enable(tx_chan);
+	fprintf(stderr, "[splash] i2s enable ret=%d\n", (int)ret);
 	xEventGroupWaitBits(global_event_group,
-			    BIT0,
+			    TINY386_EVENT_LOGO_READY,
 			    pdFALSE,
 			    pdFALSE,
 			    portMAX_DELAY);
+	fprintf(stderr, "[splash] i2s logo ready, start boot audio\n");
+	if (!startup_splash_play_wav(tx_chan)) {
+		fprintf(stderr, "[splash] boot music failed, playing fallback beep\n");
+#ifndef TINY386_NO_STARTUP_BEEP
+		i2s_play_startup_beep();
+#endif
+	} else {
+		fprintf(stderr, "[splash] boot music played\n");
+	}
+	xEventGroupSetBits(global_event_group, TINY386_EVENT_AUDIO_DONE);
+	fprintf(stderr, "[splash] audio done\n");
 
-	i2s_channel_enable(tx_chan);
+	memset(buf, 0, sizeof(buf));
+	for (;;) {
+		EventBits_t bits = xEventGroupWaitBits(global_event_group,
+						       TINY386_EVENT_PC_READY,
+						       pdFALSE,
+						       pdFALSE,
+						       0);
+		if (bits & TINY386_EVENT_PC_READY)
+			break;
+
+		size_t bwritten;
+		i2s_channel_write(tx_chan, buf, sizeof(buf), &bwritten, portMAX_DELAY);
+	}
+
 	for (;;) {
 		size_t bwritten;
 		memset(buf, 0, MIXER_BUF_LEN * 2);
 		mixer_callback(globals.pc, (uint8_t *) buf, MIXER_BUF_LEN * 2);
 		for (int i = 0; i < MIXER_BUF_LEN; i++) {
-			buf[i] = buf[i] / 16;
+			buf[i] = buf[i] / I2S_MIXER_VOLUME_DIV;
 		}
 		i2s_channel_write(tx_chan, buf, MIXER_BUF_LEN * 2, &bwritten, portMAX_DELAY);
 	}

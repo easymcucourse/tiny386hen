@@ -24,12 +24,19 @@
 #define LCD_SPI_BL         16
 #define LCD_SPI_MISO       17
 
+/* I2S audio output */
+#define I2S_MCLK I2S_GPIO_UNUSED
+#define I2S_BCLK 40
+#define I2S_WS   42
+#define I2S_DOUT 41
+#define MIXER_BUF_LEN 512
 
 
-/* ILI9341 SPI max is ~10MHz per datasheet, but short wiring often tolerates
- * much more. Speed test: push to 80MHz (ESP32-S3 SPI master ceiling). Drop
- * back to 40/26MHz if the image is garbled. */
-#define LCD_SPI_CLK_HZ     (80000000)
+
+/* This panel/wiring has been verified with the reference firmware at 80MHz.
+ * Slower clocks can leave some modules blank with the ESP LCD SPI driver.
+ */
+#define LCD_SPI_CLK_HZ     (40000000)
 #define LCD_ILI9341_H_RES  240
 #define LCD_ILI9341_V_RES  320
 

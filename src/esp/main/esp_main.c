@@ -15,12 +15,12 @@
 #include "esp_partition.h"
 #include "driver/uart.h"
 #include "esp_vfs.h"
-#include "esp_vfs_fat.h"
 #include "esp_system.h"
 
 #include "ini.h"
 #include "pc.h"
 #include "common.h"
+#include "startup_splash.h"
 
 //
 #include "esp_private/system_internal.h"
@@ -91,7 +91,14 @@ static esp_err_t partition_mmap_copy(const esp_partition_t *part,
 		return ret;
 	}
 	memcpy(dst, mmap_ptr, len);
-	esp_partition_munmap(handle);
+	/*
+	 * Keep this one-shot ROM mapping alive. On ESP-IDF 5.5 / ESP32-S3,
+	 * unmapping here can assert in spi_flash_munmap() after the copy even
+	 * though the data was read successfully. BIOS/VGABIOS are loaded once at
+	 * boot, so retaining these small mappings is safer than touching the
+	 * direct flash-read path that can stall the other core's cache.
+	 */
+	(void)handle;
 	return ESP_OK;
 }
 
@@ -127,6 +134,8 @@ static const char *rom_part_label_from_file(const char *file)
 
 	if (!file || !file[0])
 		return file;
+	if (strncmp(file, "flash:", 6) == 0)
+		return file + 6;
 	if (file[0] == '/') {
 		slash = strrchr(file, '/');
 		if (slash && slash[1])
@@ -309,12 +318,19 @@ static int pc_main(const char *file)
 	 * Doing this AFTER load_bios_and_reset avoids a Flash-PSRAM D-cache
 	 * deadlock: partition_mmap_copy (Core 1, Flash MMU read) must not
 	 * run concurrently with pc_vga_step (Core 0, PSRAM D-cache write). */
-	xEventGroupSetBits(global_event_group, BIT0);
+	xEventGroupSetBits(global_event_group, TINY386_EVENT_PC_READY);
+	fprintf(stderr, "[splash] pc ready, BIOS/VGABIOS loaded\n");
 
 	pc->boot_start_time = get_uticks();
 	uint32_t step_count = 0;
+	bool boot_sector_signaled = false;
 	for (; pc->shutdown_state != 8;) {
 		pc_step(pc);
+		if (!boot_sector_signaled && pc->boot_sector_seen) {
+			boot_sector_signaled = true;
+			fprintf(stderr, "[splash] switching display after Booting from 0000:7c00\n");
+			xEventGroupSetBits(global_event_group, TINY386_EVENT_BOOT_SECTOR);
+		}
 		/*
 		 * Let lower-priority idle task run periodically so Task WDT
 		 * does not trigger while the emulator monopolizes CPU1.
@@ -349,10 +365,11 @@ static void i386_task(void *arg)
 	/* Wait for LCD panel (and panel_fb) to be ready before starting the
 	 * PC emulator.  console_init() uses globals.panel_fb if set. */
 	xEventGroupWaitBits(global_event_group,
-	                    BIT1,
+	                    TINY386_EVENT_LOGO_READY,
 	                    pdFALSE,
 	                    pdFALSE,
 	                    portMAX_DELAY);
+	fprintf(stderr, "[splash] logo ready, starting PC in background\n");
 	pc_main(config->filename);
 	vTaskDelete(NULL);
 }
@@ -460,6 +477,7 @@ void app_main(void)
 	}
 #endif
 
+	startup_resources_mount();
 	i2s_main();
 	storage_init();
 

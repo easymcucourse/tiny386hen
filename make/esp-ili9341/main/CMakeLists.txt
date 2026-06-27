@@ -12,7 +12,7 @@ set(TINY386_CORE_SOURCES
     "${TINY386_REF_ROOT}/pc.c"
     "${TINY386_REF_ROOT}/misc.c"
     "${TINY386_REF_ROOT}/pci.c"
-    "${TINY386_REF_ROOT}/vga.c"
+    "${TINY386_ESP_SRC_ROOT}/vga.c"
     "${TINY386_REF_ROOT}/ne2000.c"
     "${TINY386_REF_ROOT}/i8257.c"
     "${TINY386_REF_ROOT}/sb16.c"
@@ -24,10 +24,12 @@ set(TINY386_CORE_SOURCES
 idf_component_register(
     SRCS
         "${TINY386_ESP_SRC_ROOT}/esp_main.c"
+        "${TINY386_ESP_SRC_ROOT}/flash_stdio.c"
         "${TINY386_ESP_SRC_ROOT}/lcd_ili9341.c"
         "${TINY386_ESP_SRC_ROOT}/sdmmc_crc_wrap.c"
         "${TINY386_ESP_SRC_ROOT}/i2s.c"
         "${TINY386_ESP_SRC_ROOT}/storage.c"
+        "${TINY386_ESP_SRC_ROOT}/startup_splash.c"
         "${TINY386_ESP_SRC_ROOT}/usb_input.c"
         "${TINY386_ESP_SRC_ROOT}/wifi.c"
         ${TINY386_CORE_SOURCES}
@@ -35,6 +37,17 @@ idf_component_register(
         "${TINY386_ESP_SRC_ROOT}"
         "${TINY386_REF_ROOT}"
         "${EMU8950_REF_ROOT}"
+    REQUIRES
+        driver
+        esp_driver_gpio
+        esp_driver_i2s
+        esp_driver_spi
+        esp_lcd
+        esp_partition
+        esp_psram
+        esp_system
+        esp_timer
+        fatfs
     LDFRAGMENTS
         linker.lf
 )
@@ -49,7 +62,13 @@ add_definitions(-DI386_ENABLE_FPU)
 
 target_link_options(${COMPONENT_LIB} INTERFACE
     -Wl,--wrap=sdmmc_init_spi_crc
-    -Wl,--undefined=__wrap_sdmmc_init_spi_crc)
+    -Wl,--undefined=__wrap_sdmmc_init_spi_crc
+    -Wl,--wrap=fopen
+    -Wl,--wrap=fread
+    -Wl,--wrap=fwrite
+    -Wl,--wrap=fseeko
+    -Wl,--wrap=ftello
+    -Wl,--wrap=fclose)
 
 set_source_files_properties("${TINY386_ESP_SRC_ROOT}/adlib.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${EMU8950_REF_ROOT}/emu8950.c" PROPERTIES COMPILE_FLAGS "-Wno-all -fsingle-precision-constant")
@@ -57,7 +76,7 @@ set_source_files_properties("${EMU8950_REF_ROOT}/emuadpcm.c" PROPERTIES COMPILE_
 set_source_files_properties("${TINY386_REF_ROOT}/fpu.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_REF_ROOT}/i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("${TINY386_REF_ROOT}/i8042.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
-set_source_files_properties("${TINY386_REF_ROOT}/vga.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
+set_source_files_properties("${TINY386_ESP_SRC_ROOT}/vga.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("${TINY386_REF_ROOT}/pc.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("${TINY386_REF_ROOT}/ne2000.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_REF_ROOT}/sb16.c" PROPERTIES COMPILE_FLAGS "-Wno-all")

@@ -9,12 +9,16 @@
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_ili9341.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #include "common.h"
+#include "startup_splash.h"
 
 static const char *TAG = "lcd_ili9341";
+
+#define SPLASH_MIN_VISIBLE_MS 2000
 
 void pc_vga_step(void *o);
 
@@ -82,12 +86,23 @@ void vga_task(void *arg)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
     globals.panel = panel;
-    xEventGroupSetBits(global_event_group, BIT1);
+
+    int64_t splash_start_us = esp_timer_get_time();
+    bool logo_ok = startup_splash_draw_logo();
+    ESP_LOGI(TAG, "startup logo %s", logo_ok ? "shown" : "not shown");
+    xEventGroupSetBits(global_event_group, TINY386_EVENT_LOGO_READY);
+    int64_t elapsed_ms = (esp_timer_get_time() - splash_start_us) / 1000;
+    if (elapsed_ms < SPLASH_MIN_VISIBLE_MS) {
+        vTaskDelay(pdMS_TO_TICKS(SPLASH_MIN_VISIBLE_MS - elapsed_ms));
+    }
+    xEventGroupSetBits(global_event_group, TINY386_EVENT_SPLASH_DONE);
+    ESP_LOGI(TAG, "waiting for Booting from 0000:7c00 before VM display");
     xEventGroupWaitBits(global_event_group,
-                        BIT0,
+                        TINY386_EVENT_BOOT_SECTOR,
                         pdFALSE,
                         pdFALSE,
                         portMAX_DELAY);
+    ESP_LOGI(TAG, "boot sector reached, switching to VM display");
 
     while (1) {
         pc_vga_step(globals.pc);
