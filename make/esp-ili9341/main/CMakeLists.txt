@@ -1,15 +1,16 @@
 set(TINY386_ESP_SRC_ROOT "${TINY386HEN_SRC_ROOT}/esp/main")
+set(TINY386_OVERLAY_ROOT "${TINY386HEN_SRC_ROOT}/tiny386")
 
 set(TINY386_CORE_SOURCES
     "${TINY386_ESP_SRC_ROOT}/adlib.c"
     "${TINY386_REF_ROOT}/fpu.c"
-    "${TINY386_REF_ROOT}/i386.c"
+    "${TINY386_OVERLAY_ROOT}/i386.c"
     "${TINY386_REF_ROOT}/i8042.c"
     "${TINY386_REF_ROOT}/i8254.c"
     "${TINY386_REF_ROOT}/i8259.c"
     "${TINY386_REF_ROOT}/ide.c"
     "${TINY386_REF_ROOT}/ini.c"
-    "${TINY386_REF_ROOT}/pc.c"
+    "${TINY386_OVERLAY_ROOT}/pc.c"
     "${TINY386_REF_ROOT}/misc.c"
     "${TINY386_REF_ROOT}/pci.c"
     "${TINY386_ESP_SRC_ROOT}/vga.c"
@@ -35,6 +36,7 @@ idf_component_register(
         ${TINY386_CORE_SOURCES}
     INCLUDE_DIRS
         "${TINY386_ESP_SRC_ROOT}"
+        "${TINY386_OVERLAY_ROOT}"
         "${TINY386_REF_ROOT}"
         "${EMU8950_REF_ROOT}"
     REQUIRES
@@ -54,6 +56,7 @@ idf_component_register(
 
 message(STATUS "Building tiny386hen ESP overlay for BOARD=${BOARD}")
 message(STATUS "Using ESP glue from ${TINY386_ESP_SRC_ROOT}")
+message(STATUS "Using tiny386 overlays from ${TINY386_OVERLAY_ROOT}")
 message(STATUS "Using tiny386 refs from ${TINY386_REF_ROOT}")
 message(STATUS "Using emu8950 refs from ${EMU8950_REF_ROOT}")
 
@@ -74,10 +77,10 @@ set_source_files_properties("${TINY386_ESP_SRC_ROOT}/adlib.c" PROPERTIES COMPILE
 set_source_files_properties("${EMU8950_REF_ROOT}/emu8950.c" PROPERTIES COMPILE_FLAGS "-Wno-all -fsingle-precision-constant")
 set_source_files_properties("${EMU8950_REF_ROOT}/emuadpcm.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_REF_ROOT}/fpu.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
-set_source_files_properties("${TINY386_REF_ROOT}/i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
+set_source_files_properties("${TINY386_OVERLAY_ROOT}/i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("${TINY386_REF_ROOT}/i8042.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_ESP_SRC_ROOT}/vga.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
-set_source_files_properties("${TINY386_REF_ROOT}/pc.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
+set_source_files_properties("${TINY386_OVERLAY_ROOT}/pc.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("${TINY386_REF_ROOT}/ne2000.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_REF_ROOT}/sb16.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_REF_ROOT}/i8257.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
