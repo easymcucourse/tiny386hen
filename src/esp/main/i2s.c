@@ -13,8 +13,8 @@ void mixer_callback (void *opaque, uint8_t *stream, int free);
 #define MIXER_BUF_LEN 128
 #endif
 
-#ifndef I2S_MIXER_VOLUME_DIV
-#define I2S_MIXER_VOLUME_DIV 5
+#ifndef I2S_OUTPUT_VOLUME_PERCENT
+#define I2S_OUTPUT_VOLUME_PERCENT 100
 #endif
 
 #ifndef I2S_STARTUP_BEEP_HZ
@@ -48,6 +48,7 @@ static void i2s_play_startup_beep(void)
 		for (int i = 0; i < frames; i++) {
 			int phase = (frame + i) % period;
 			int sample = phase < (period / 2) ? I2S_STARTUP_BEEP_VOLUME : -I2S_STARTUP_BEEP_VOLUME;
+			sample = sample * I2S_OUTPUT_VOLUME_PERCENT / 100;
 			buf[i * 2] = sample;
 			buf[i * 2 + 1] = sample;
 		}
@@ -107,7 +108,7 @@ static void i2s_task(void *arg)
 		memset(buf, 0, MIXER_BUF_LEN * 2);
 		mixer_callback(globals.pc, (uint8_t *) buf, MIXER_BUF_LEN * 2);
 		for (int i = 0; i < MIXER_BUF_LEN; i++) {
-			buf[i] = buf[i] / I2S_MIXER_VOLUME_DIV;
+			buf[i] = buf[i] * I2S_OUTPUT_VOLUME_PERCENT / 100;
 		}
 		i2s_channel_write(tx_chan, buf, MIXER_BUF_LEN * 2, &bwritten, portMAX_DELAY);
 	}
