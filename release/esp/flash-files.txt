@@ -1,8 +1,8 @@
 0x0 bootloader.bin
 0x10000 tiny386hen_ili9341.bin
 0x8000 partition-table.bin
+0xf00000 resources.bin
 0x200000 tiny386.ini
 0x1d0000 bios.bin
 0x1f0000 vgabios.bin
 0x210000 dos.img
-0xF00000 resources.bin

@@ -1,6 +1,7 @@
 #include "startup_splash.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -13,12 +14,10 @@
 #define RES_VERSION 1
 #define LOGO_ID "LOGO565"
 #define MUSIC_ID "MUSICPCM"
-#define LCD_STRIP_ROWS 16
+#define LCD_STRIP_ROWS 4
 
 void lcd_draw(int x_start, int y_start, int x_end, int y_end, void *src);
-
-static uint16_t s_lcd_strip[LCD_HEIGHT * LCD_STRIP_ROWS];
-static uint8_t s_i2s_dma_buf[1024];
+void lcd_wait_flush_done(void);
 
 typedef struct {
 	char magic[8];
@@ -134,6 +133,11 @@ bool startup_splash_draw_logo(void)
 	const resource_entry_t *entry = find_entry(LOGO_ID);
 	if (!entry)
 		return false;
+	uint16_t *lcd_strip = malloc(LCD_HEIGHT * LCD_STRIP_ROWS * sizeof(*lcd_strip));
+	if (!lcd_strip) {
+		fprintf(stderr, "[splash] logo buffer allocation failed\n");
+		return false;
+	}
 
 	uint32_t offset = read_u32(&entry->offset);
 	uint32_t size = read_u32(&entry->size);
@@ -145,6 +149,7 @@ bool startup_splash_draw_logo(void)
 			"[splash] invalid logo: %ux%u size=%lu expected=%lu\n",
 			width, height, (unsigned long)size,
 			(unsigned long)LCD_HEIGHT * LCD_WIDTH * sizeof(uint16_t));
+		free(lcd_strip);
 		return false;
 	}
 
@@ -157,13 +162,16 @@ bool startup_splash_draw_logo(void)
 		size_t bytes = (size_t)rows * LCD_HEIGHT * sizeof(uint16_t);
 		esp_err_t ret = esp_partition_read(s_res_part,
 						   offset + (size_t)y * LCD_HEIGHT * sizeof(uint16_t),
-						   s_lcd_strip, bytes);
+						   lcd_strip, bytes);
 		if (ret != ESP_OK) {
 			fprintf(stderr, "[splash] logo read failed y=%d ret=%d\n", y, (int)ret);
+			free(lcd_strip);
 			return false;
 		}
-		lcd_draw(0, y, LCD_HEIGHT, y + rows, s_lcd_strip);
+		lcd_draw(0, y, LCD_HEIGHT, y + rows, lcd_strip);
+		lcd_wait_flush_done();
 	}
+	free(lcd_strip);
 	fprintf(stderr, "[splash] logo draw complete\n");
 	return true;
 }
@@ -174,6 +182,11 @@ bool startup_splash_play_wav(void *i2s_tx_chan)
 	const resource_entry_t *entry = find_entry(MUSIC_ID);
 	if (!entry)
 		return false;
+	uint8_t *i2s_dma_buf = malloc(1024);
+	if (!i2s_dma_buf) {
+		fprintf(stderr, "[splash] music buffer allocation failed\n");
+		return false;
+	}
 
 	uint32_t offset = read_u32(&entry->offset);
 	uint32_t size = read_u32(&entry->size);
@@ -185,6 +198,7 @@ bool startup_splash_play_wav(void *i2s_tx_chan)
 		fprintf(stderr,
 			"[splash] invalid music: rate=%u channels=%u bits=%u size=%lu\n",
 			rate, channels, bits, (unsigned long)size);
+		free(i2s_dma_buf);
 		return false;
 	}
 
@@ -192,31 +206,36 @@ bool startup_splash_play_wav(void *i2s_tx_chan)
 		rate, channels, bits, (unsigned long)size);
 	uint32_t pos = offset;
 	while (size > 0) {
-		size_t chunk = size > sizeof(s_i2s_dma_buf) ? sizeof(s_i2s_dma_buf) : size;
+		size_t chunk = size > 1024 ? 1024 : size;
 		size_t bwritten;
-		esp_err_t ret = esp_partition_read(s_res_part, pos, s_i2s_dma_buf, chunk);
+		esp_err_t ret = esp_partition_read(s_res_part, pos, i2s_dma_buf, chunk);
 		if (ret != ESP_OK) {
 			fprintf(stderr, "[splash] music read failed pos=0x%lx ret=%d\n",
 				(unsigned long)pos, (int)ret);
+			free(i2s_dma_buf);
 			return false;
 		}
-		if (i2s_channel_write(tx, s_i2s_dma_buf, chunk,
-				      &bwritten, portMAX_DELAY) != ESP_OK)
+		if (i2s_channel_write(tx, i2s_dma_buf, chunk,
+				      &bwritten, portMAX_DELAY) != ESP_OK) {
+			free(i2s_dma_buf);
 			return false;
+		}
 		if (bwritten != chunk) {
 			fprintf(stderr, "[splash] music short write: %u/%u\n",
 				(unsigned)bwritten, (unsigned)chunk);
+			free(i2s_dma_buf);
 			return false;
 		}
 		pos += chunk;
 		size -= chunk;
 	}
-	memset(s_i2s_dma_buf, 0, sizeof(s_i2s_dma_buf));
+	memset(i2s_dma_buf, 0, 1024);
 	for (int i = 0; i < 4; i++) {
 		size_t bwritten;
-		i2s_channel_write(tx, s_i2s_dma_buf, sizeof(s_i2s_dma_buf),
+		i2s_channel_write(tx, i2s_dma_buf, 1024,
 				  &bwritten, portMAX_DELAY);
 	}
+	free(i2s_dma_buf);
 	fprintf(stderr, "[splash] music play complete\n");
 	return true;
 }

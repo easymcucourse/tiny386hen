@@ -16,6 +16,7 @@ set(TINY386HEN_ROOT "${CMAKE_CURRENT_LIST_DIR}/../..")
 set(TINY386HEN_SRC_ROOT "${TINY386HEN_ROOT}/src")
 set(TINY386_REF_ROOT "${TINY386HEN_ROOT}/refs/tiny386")
 set(EMU8950_REF_ROOT "${TINY386HEN_ROOT}/refs/emu8950")
+set(COMPONENTS main)
 
 if(NOT EXISTS "${TINY386_REF_ROOT}/i386.c")
     message(FATAL_ERROR "refs/tiny386 is missing. Run git submodule update --init --recursive")

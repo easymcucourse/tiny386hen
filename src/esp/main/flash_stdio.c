@@ -8,7 +8,7 @@
 #include "esp_partition.h"
 
 #define FLASH_FILE_MAGIC 0x46464c53u
-#define FLASH_FILE_MAX 4
+#define FLASH_FILE_MAX 2
 #define FLASH_SECTOR_SIZE 4096
 
 typedef struct {

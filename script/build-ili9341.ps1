@@ -21,9 +21,24 @@ function Add-MergePair {
         [string]$Source
     )
 
-    if (Test-Path $Source) {
+    $key = $Offset.ToLowerInvariant()
+    if ((Test-Path $Source) -and !$script:mergeOffsets.ContainsKey($key)) {
+        $script:mergeOffsets[$key] = $true
         $script:mergePairs += $Offset
         $script:mergePairs += $Source
+    }
+}
+
+function Add-FlashPair {
+    param(
+        [string]$Offset,
+        [string]$File
+    )
+
+    $key = $Offset.ToLowerInvariant()
+    if (!$script:flashOffsets.ContainsKey($key)) {
+        $script:flashOffsets[$key] = $true
+        $script:flashPairs += [pscustomobject]@{ Offset = $Offset; File = $File }
     }
 }
 
@@ -95,6 +110,8 @@ New-Item -ItemType Directory -Force -Path $ReleaseDir | Out-Null
 
 $mergePairs = @()
 $flashPairs = @()
+$mergeOffsets = @{}
+$flashOffsets = @{}
 $flasherArgs.flash_files.PSObject.Properties | ForEach-Object {
     $offset = $_.Name
     $relativePath = $_.Value
@@ -105,9 +122,8 @@ $flasherArgs.flash_files.PSObject.Properties | ForEach-Object {
 
     $dest = Join-Path $ReleaseDir (Split-Path $relativePath -Leaf)
     Copy-Item -LiteralPath $source -Destination $dest -Force
-    $mergePairs += $offset
-    $mergePairs += $source
-    $flashPairs += [pscustomobject]@{ Offset = $offset; File = (Split-Path $dest -Leaf) }
+    Add-MergePair $offset $source
+    Add-FlashPair $offset (Split-Path $dest -Leaf)
 }
 
 $iniSource = Join-Path $ProjectDir "tiny386.ini"
@@ -116,7 +132,7 @@ if (!(Test-Path $iniSource)) {
 }
 if (Test-Path $iniSource) {
     Copy-Item -LiteralPath $iniSource -Destination (Join-Path $ReleaseDir "tiny386.ini") -Force
-    $flashPairs += [pscustomobject]@{ Offset = "0x200000"; File = "tiny386.ini" }
+    Add-FlashPair "0x200000" "tiny386.ini"
 }
 
 foreach ($name in @("bios.bin", "vgabios.bin")) {
@@ -124,14 +140,14 @@ foreach ($name in @("bios.bin", "vgabios.bin")) {
     if (Test-Path $source) {
         Copy-Item -LiteralPath $source -Destination (Join-Path $ReleaseDir $name) -Force
         $offset = if ($name -eq "bios.bin") { "0x1d0000" } else { "0x1f0000" }
-        $flashPairs += [pscustomobject]@{ Offset = $offset; File = $name }
+        Add-FlashPair $offset $name
     }
 }
 
 $dosSource = Join-Path $Root "release\dos.img"
 if (Test-Path $dosSource) {
     Copy-Item -LiteralPath $dosSource -Destination (Join-Path $ReleaseDir "dos.img") -Force
-    $flashPairs += [pscustomobject]@{ Offset = "0x210000"; File = "dos.img" }
+    Add-FlashPair "0x210000" "dos.img"
 }
 
 $assetsDir = Join-Path $Root "assets"
@@ -141,7 +157,7 @@ if ((Test-Path $assetsDir) -and (Test-Path $packResources)) {
         python $packResources --assets $assetsDir --output $AssetsResourceImage --partition-size 0x100000
     }
     Copy-Item -LiteralPath $AssetsResourceImage -Destination $ResourceImage -Force
-    $flashPairs += [pscustomobject]@{ Offset = "0xF00000"; File = "resources.bin" }
+    Add-FlashPair "0xF00000" "resources.bin"
 }
 
 $flashArgsText = ($flashPairs | ForEach-Object { "$($_.Offset) $($_.File)" }) -join [Environment]::NewLine

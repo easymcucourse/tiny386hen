@@ -84,10 +84,11 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
 
 #
-# Wireless disabled to save RAM (app also uses TINY386_NO_WIFI in board header)
+# Wireless and network stack disabled to save RAM
 #
 CONFIG_BT_ENABLED=n
 CONFIG_ESP_WIFI_ENABLED=n
+CONFIG_LWIP_ENABLE=n
 
 #
 # USB Host (keyboard/mouse via HID, include hub support)

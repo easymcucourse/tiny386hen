@@ -11,16 +11,32 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "common.h"
 #include "startup_splash.h"
 
 static const char *TAG = "lcd_ili9341";
+static SemaphoreHandle_t s_lcd_flush_done;
 
 #define SPLASH_MIN_VISIBLE_MS 2000
 
 void pc_vga_step(void *o);
+
+static bool lcd_color_trans_done(esp_lcd_panel_io_handle_t panel_io,
+                                 esp_lcd_panel_io_event_data_t *edata,
+                                 void *user_ctx)
+{
+    BaseType_t task_woken = pdFALSE;
+
+    (void)panel_io;
+    (void)edata;
+    (void)user_ctx;
+    if (s_lcd_flush_done)
+        xSemaphoreGiveFromISR(s_lcd_flush_done, &task_woken);
+    return task_woken == pdTRUE;
+}
 
 void lcd_draw(int x_start, int y_start, int x_end, int y_end, void *src)
 {
@@ -31,6 +47,12 @@ void lcd_draw(int x_start, int y_start, int x_end, int y_end, void *src)
             x_end, y_end,
             src));
     }
+}
+
+void lcd_wait_flush_done(void)
+{
+    if (s_lcd_flush_done)
+        xSemaphoreTake(s_lcd_flush_done, portMAX_DELAY);
 }
 
 void vga_task(void *arg)
@@ -57,6 +79,8 @@ void vga_task(void *arg)
         .max_transfer_sz = LCD_WIDTH * 32 * 2,
     };
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+    s_lcd_flush_done = xSemaphoreCreateBinary();
+    assert(s_lcd_flush_done);
 
     esp_lcd_panel_io_handle_t io_handle = NULL;
     esp_lcd_panel_io_spi_config_t io_cfg = {
@@ -67,6 +91,7 @@ void vga_task(void *arg)
         .lcd_param_bits = 8,
         .spi_mode = 0,
         .trans_queue_depth = 10,
+        .on_color_trans_done = lcd_color_trans_done,
     };
     ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(
         (esp_lcd_spi_bus_handle_t)LCD_SPI_HOST, &io_cfg, &io_handle));
