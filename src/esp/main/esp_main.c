@@ -20,6 +20,7 @@
 #include "ini.h"
 #include "pc.h"
 #include "common.h"
+#include "debugcon.h"
 #include "startup_splash.h"
 #include "timestamp_stdio.h"
 
@@ -569,6 +570,7 @@ void app_main(void)
 	}
 
 	if (psram) {
+		debugcon_init();
 		xTaskCreatePinnedToCore(i386_task, "i386_main", 8192, &config, 3, NULL, 1);
 		xTaskCreatePinnedToCore(vga_task, "vga_task", 4096, NULL, 0, NULL, 0);
 	}

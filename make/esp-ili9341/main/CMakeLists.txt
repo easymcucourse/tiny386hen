@@ -28,6 +28,7 @@ set(TINY386_CORE_SOURCES
 idf_component_register(
     SRCS
         "${TINY386_ESP_SRC_ROOT}/esp_main.c"
+        "${TINY386_ESP_SRC_ROOT}/debugcon.c"
         "${TINY386_ESP_SRC_ROOT}/flash_stdio.c"
         "${TINY386_ESP_SRC_ROOT}/lcd_ili9341.c"
         "${TINY386_ESP_SRC_ROOT}/sdmmc_crc_wrap.c"

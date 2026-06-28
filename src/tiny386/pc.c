@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #ifdef BUILD_ESP32
+#include "debugcon.h"
 #include "esp_attr.h"
 #include "timestamp_stdio.h"
 #endif
@@ -434,8 +435,12 @@ static void pc_io_write(void *o, int addr, u8 val)
 		vga_ioport_write(pc->vga, addr, val);
 		return;
 	case 0x402:
+#ifdef BUILD_ESP32
+		debugcon_write_char(val);
+#else
 		putchar(val);
 		fflush(stdout);
+#endif
 		{
 			static const char boot_msg[] = "Booting from 0000:7c00";
 			char ch = (char)val;
