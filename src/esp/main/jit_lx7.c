@@ -1061,6 +1061,8 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
 
     if (TINY386_JIT_LEVEL <= 0)
         return false;
+    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NOT_R)
+        return true;
     /*
      * Keep DEC disabled until the emitter preserves x86 lazy flags correctly.
      * DEC-only firmware tests WDT around SeaBIOS relocation.
