@@ -500,6 +500,7 @@ typedef enum {
     ACT_CWDE,       /* EAX = sign_extend(AX), no flags */
     ACT_CDQ,        /* EDX = sign_extend(EAX), no flags */
     ACT_XCHG_EAX_R, /* swap EAX with another GPR, no flags */
+    ACT_BSWAP_R,    /* byte-swap a 32-bit GPR, no flags */
     ACT_BLOCK_END,  /* last instruction of block, no jump */
 } ActionType;
 
@@ -746,6 +747,11 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
     /* ── Jcc rel32  (0F 80-8F) ───────────────────────────────── */
     if (op == 0x0F) {
         uint8_t op2 = src[len++];
+        if (op2 >= 0xC8 && op2 <= 0xCF) {
+            a->type = ACT_BSWAP_R;
+            a->dst  = op2 & 7;
+            return len;
+        }
         if (op2 >= 0x80 && op2 <= 0x8F) {
             int32_t rel = (int32_t)((uint32_t)src[len]     | ((uint32_t)src[len+1] << 8) |
                                     ((uint32_t)src[len+2] << 16) | ((uint32_t)src[len+3] << 24));
@@ -819,6 +825,30 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         emit_mov(p, X86REG_TO_LX7(0), sr);
         emit_mov(p, sr, t0);
         break;
+
+    case ACT_BSWAP_R: {
+        int t2 = LX7_TMP2;
+        GUARD(56);
+        emit_mov(p, t0, dr);          /* b0 -> bits 24..31 */
+        emit_mov(p, t1, dr);          /* b1 -> bits 16..23 */
+        emit_mov(p, t2, dr);          /* b2 -> bits  8..15 */
+        emit_slli(p, t0, t0, 24);
+        emit_srli(p, t1, t1, 8);
+        emit_slli(p, t1, t1, 24);
+        emit_srli(p, t1, t1, 8);
+        emit_srli(p, t2, t2, 8);
+        emit_srli(p, t2, t2, 8);
+        emit_slli(p, t2, t2, 24);
+        emit_srli(p, t2, t2, 8);
+        emit_srli(p, t2, t2, 8);
+        emit_srli(p, dr, dr, 8);      /* b3 -> bits 0..7 */
+        emit_srli(p, dr, dr, 8);
+        emit_srli(p, dr, dr, 8);
+        emit_or(p, dr, dr, t0);
+        emit_or(p, dr, dr, t1);
+        emit_or(p, dr, dr, t2);
+        break;
+    }
 
     /* ---- MOV ------------------------------------------------ */
     case ACT_MOV_RR:
@@ -1105,6 +1135,8 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CDQ)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_XCHG_EAX_R)
+        return true;
+    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_BSWAP_R)
         return true;
     /*
      * Keep DEC disabled until the emitter preserves x86 lazy flags correctly.
