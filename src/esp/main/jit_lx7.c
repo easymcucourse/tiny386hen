@@ -498,6 +498,7 @@ typedef enum {
     ACT_JMP,        /* unconditional jump; failed in BIOS relocation tests; needs tracing. */
     ACT_JCC,        /* conditional jump;   target_eip set */
     ACT_CWDE,       /* EAX = sign_extend(AX), no flags */
+    ACT_CDQ,        /* EDX = sign_extend(EAX), no flags */
     ACT_BLOCK_END,  /* last instruction of block, no jump */
 } ActionType;
 
@@ -555,6 +556,11 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
 
     if (op == 0x98) {
         a->type = ACT_CWDE;
+        return len;
+    }
+
+    if (op == 0x99) {
+        a->type = ACT_CDQ;
         return len;
     }
 
@@ -793,6 +799,11 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         GUARD(6);
         emit_slli(p, X86REG_TO_LX7(0), X86REG_TO_LX7(0), 16);
         emit_srai(p, X86REG_TO_LX7(0), X86REG_TO_LX7(0), 16);
+        break;
+
+    case ACT_CDQ:
+        GUARD(3);
+        emit_srai(p, X86REG_TO_LX7(2), X86REG_TO_LX7(0), 31);
         break;
 
     /* ---- MOV ------------------------------------------------ */
@@ -1076,6 +1087,8 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NOT_R)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CWDE)
+        return true;
+    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CDQ)
         return true;
     /*
      * Keep DEC disabled until the emitter preserves x86 lazy flags correctly.
