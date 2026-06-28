@@ -5165,6 +5165,7 @@ void IRAM_ATTR_CPU_EXEC1 cpui386_step(CPUI386 *cpu, int stepcount)
 		if (consumed > 0) {
 			steps += consumed;
 			cpu->cycle += consumed;
+			cpu->ip = cpu->next_ip;
 			cpu->ifetch.paddr = 0;
 		} else {
 			break;

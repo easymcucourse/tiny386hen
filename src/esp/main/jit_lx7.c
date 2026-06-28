@@ -50,6 +50,31 @@ extern const uint8_t jit_lx7_mov_rr_a3_a10[8][8][2];
 #define TINY386_JIT_SINGLE_INSN_BLOCK 0
 #endif
 
+/*
+ * Bring-up gates for actions that are structurally simple but still need
+ * board-level smoke tests. This follows the DOSBox-X dynrec habit of keeping
+ * block kinds explicit and independently disableable while a backend matures.
+ */
+#ifndef TINY386_JIT_ENABLE_MOV_RR
+#define TINY386_JIT_ENABLE_MOV_RR 0
+#endif
+
+#ifndef TINY386_JIT_ENABLE_JMP
+#define TINY386_JIT_ENABLE_JMP 0
+#endif
+
+#ifndef TINY386_JIT_MOV_RR_SINGLE_BLOCK
+#define TINY386_JIT_MOV_RR_SINGLE_BLOCK 1
+#endif
+
+#ifndef TINY386_JIT_JMP_SINGLE_BLOCK
+#define TINY386_JIT_JMP_SINGLE_BLOCK 1
+#endif
+
+#ifndef TINY386_JIT_USE_MOV_N
+#define TINY386_JIT_USE_MOV_N 0
+#endif
+
 #ifdef BUILD_ESP32
 #  include "esp_attr.h"
    /* Static IRAM pool – the linker places this in instruction-accessible RAM */
@@ -124,6 +149,7 @@ static inline void emit_neg(EmitPtr *p, int r, int t)
 /* MOV ar, as  (implemented as OR ar, as, as) */
 static inline void emit_mov(EmitPtr *p, int r, int s)
 {
+#if TINY386_JIT_USE_MOV_N
     if ((unsigned)(r - 3) < 8u && (unsigned)(s - 3) < 8u) {
         const uint8_t *code = jit_lx7_mov_rr_a3_a10[r - 3][s - 3];
         (*p)[0] = code[0];
@@ -135,6 +161,9 @@ static inline void emit_mov(EmitPtr *p, int r, int s)
     (*p)[0] = (uint8_t)((r << 4) | 0x0D);
     (*p)[1] = (uint8_t)s;
     *p += 2;
+#else
+    emit_or(p, r, s, s);
+#endif
 }
 
 /* SSL as  — load SAR = (32 - as) for left shifts */
@@ -1267,6 +1296,11 @@ static JITExitKind jit_exit_kind_for_actions(const X86Action *actions, int count
     }
 }
 
+static bool jit_action_ends_block(const X86Action *a)
+{
+    return a->type == ACT_JMP || a->type == ACT_JCC || a->type == ACT_BLOCK_END;
+}
+
 static bool jit_action_enabled(const X86Action *a, int block_insn_index)
 {
     /*
@@ -1314,6 +1348,12 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CDQ)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_BSWAP_R)
+        return true;
+    if (TINY386_JIT_LEVEL >= 2 && TINY386_JIT_ENABLE_MOV_RR &&
+        a->type == ACT_MOV_RR)
+        return true;
+    if (TINY386_JIT_LEVEL >= 2 && TINY386_JIT_ENABLE_JMP &&
+        a->type == ACT_JMP)
         return true;
     /*
      * Keep the expanded level-2 instruction set disabled for now.  Enabling
@@ -1436,13 +1476,16 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     if (block->status == JIT_NOJIT && block->guest_paddr == paddr)
         return NULL; /* previously deemed un-translatable */
 
-    if (paddr + JIT_SCAN_LIMIT * 16 > phys_mem_size) {
+    if (paddr >= phys_mem_size) {
         jit_mark_nojit(block, paddr, paddr, JIT_BAIL_OUT_OF_GUEST_MEM);
         jit->bailed++;
         return NULL;
     }
 
     const uint8_t *x86 = (const uint8_t *)cpui386_get_phys_mem(cpu) + paddr;
+    uint32_t page_left = JIT_GUEST_PAGE_SIZE - (paddr & (JIT_GUEST_PAGE_SIZE - 1u));
+    uint32_t mem_left  = phys_mem_size - paddr;
+    uint32_t scan_left = (page_left < mem_left) ? page_left : mem_left;
 
     /* Evict the old entry if occupied by a different address */
     if (block->status == JIT_VALID && block->guest_paddr != paddr)
@@ -1474,7 +1517,20 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
     for (int n = 0; n < JIT_SCAN_LIMIT; n++) {
         X86Action *a = &actions[n];
+        if ((uint32_t)x86_consumed >= scan_left) {
+            scan_bail = JIT_BAIL_OUT_OF_GUEST_MEM;
+            break;
+        }
+        if (scan_left - (uint32_t)x86_consumed < 6u) {
+            scan_bail = JIT_BAIL_OUT_OF_GUEST_MEM;
+            break;
+        }
+
         int bytes = decode_x86_insn(x86 + x86_consumed, cur_eip, a);
+        if (bytes != 0 && (uint32_t)(x86_consumed + bytes) > scan_left) {
+            scan_bail = JIT_BAIL_OUT_OF_GUEST_MEM;
+            bytes = 0;
+        }
         if (bytes != 0 && !jit_action_enabled(a, n)) {
             scan_bail = JIT_BAIL_DISABLED;
             bytes = 0;
@@ -1487,8 +1543,16 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         cur_eip      += bytes;
         insn_count++;
 
-        if (a->type == ACT_JMP || a->type == ACT_JCC || a->type == ACT_BLOCK_END)
+        if (jit_action_ends_block(a))
             break;
+#if TINY386_JIT_MOV_RR_SINGLE_BLOCK
+        if (a->type == ACT_MOV_RR)
+            break;
+#endif
+#if TINY386_JIT_JMP_SINGLE_BLOCK
+        if (a->type == ACT_JMP)
+            break;
+#endif
     }
 
     if (insn_count == 0) {
@@ -1532,6 +1596,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     int      emitted_insns = 0;
     bool     ok   = true;
     uint16_t block_flags = JIT_BLOCKF_NONE;
+    bool     ended_block = false;
     cur_eip = eip;
 
     for (int n = 0; n < insn_count; n++) {
@@ -1544,11 +1609,20 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         emitted_bytes += bytes;
         emitted_insns++;
         cur_eip       += bytes;
+        ended_block    = jit_action_ends_block(a);
 
 #if TINY386_JIT_SINGLE_INSN_BLOCK
         emit_epilogue(&p, LX7_CPU_REG, cur_eip);
+        ended_block = true;
         break;
 #endif
+    }
+
+    if (ok && !ended_block) {
+        if (p + 80 < code_end)
+            emit_epilogue(&p, LX7_CPU_REG, cur_eip);
+        else
+            ok = false;
     }
 
     if (!ok || p >= code_end) {
