@@ -7,6 +7,7 @@
 
 #ifdef BUILD_ESP32
 #include "esp_attr.h"
+#include "timestamp_stdio.h"
 #ifdef TINY386_ENABLE_JIT
 #include "jit_lx7.h"
 #endif

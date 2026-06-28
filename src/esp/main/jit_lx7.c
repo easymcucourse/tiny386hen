@@ -1134,8 +1134,24 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CDQ)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_XCHG_EAX_R)
-        return true;
+    /*
+     * Keep ACT_XCHG_EAX_R disabled for now.
+     *
+     * The instruction is semantically simple and passed the 30-second boot
+     * smoke test, but the boot benchmark consistently showed it making the
+     * interval from "set VGA mode 1" to "BENCH_START CO80" slower:
+     *
+     *   baseline:        22369 ms -> 43237 ms = 20868 ms
+     *   +CDQ:            22368 ms -> 43232 ms = 20864 ms
+     *   +CDQ+XCHG:       22377 ms -> 43251 ms = 20874 ms
+     *   +XCHG only:      22371 ms -> 43251 ms = 20880 ms
+     *
+     * That points at XCHG itself rather than CDQ/BSWAP interaction.  Leave
+     * the decoder/emitter in place so it can be re-tested later, but do not
+     * enable it in the normal level-2 JIT set until the slowdown is explained.
+     */
+    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_XCHG_EAX_R)
+        return true; */
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_BSWAP_R)
         return true;
     /*

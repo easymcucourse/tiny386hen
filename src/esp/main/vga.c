@@ -34,6 +34,7 @@
 
 #ifdef BUILD_ESP32
 #include "esp_attr.h"
+#include "timestamp_stdio.h"
 void *pcmalloc(long size);
 #define RETRACE_INTERVAL_US 5000
 #else

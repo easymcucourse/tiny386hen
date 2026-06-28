@@ -34,6 +34,7 @@ idf_component_register(
         "${TINY386_ESP_SRC_ROOT}/i2s.c"
         "${TINY386_ESP_SRC_ROOT}/storage.c"
         "${TINY386_ESP_SRC_ROOT}/startup_splash.c"
+        "${TINY386_ESP_SRC_ROOT}/timestamp_stdio.c"
         "${TINY386_ESP_SRC_ROOT}/usb_input.c"
         "${TINY386_ESP_SRC_ROOT}/wifi.c"
         ${TINY386_CORE_SOURCES}

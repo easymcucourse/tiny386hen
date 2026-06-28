@@ -16,6 +16,7 @@
 
 #include "common.h"
 #include "startup_splash.h"
+#include "timestamp_stdio.h"
 
 static const char *TAG = "lcd_ili9341";
 static SemaphoreHandle_t s_lcd_flush_done;

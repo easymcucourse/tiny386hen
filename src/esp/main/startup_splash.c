@@ -9,6 +9,7 @@
 #include "esp_partition.h"
 
 #include "common.h"
+#include "timestamp_stdio.h"
 
 #define RES_MAGIC "T386RES"
 #define RES_VERSION 1

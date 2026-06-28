@@ -5,6 +5,7 @@
 #include "driver/i2s_std.h"
 #include "common.h"
 #include "startup_splash.h"
+#include "timestamp_stdio.h"
 
 static i2s_chan_handle_t                tx_chan;        // I2S tx channel handler
 void mixer_callback (void *opaque, uint8_t *stream, int free);

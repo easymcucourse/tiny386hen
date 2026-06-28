@@ -16,6 +16,7 @@
 #ifdef SD_PWR_CTRL_LDO_IO_ID
 #include "sd_pwr_ctrl_by_on_chip_ldo.h"
 #endif
+#include "timestamp_stdio.h"
 
 static const char *TAG = "storage";
 void *rawsd;

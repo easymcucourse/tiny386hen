@@ -21,6 +21,7 @@
 #include "pc.h"
 #include "common.h"
 #include "startup_splash.h"
+#include "timestamp_stdio.h"
 
 #ifndef PC_PERF_LOG_INTERVAL_US
 #define PC_PERF_LOG_INTERVAL_US 1000000u

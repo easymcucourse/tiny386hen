@@ -60,7 +60,7 @@
 #define SD_SPI_MOSI      10
 #define SD_SPI_MISO      11
 #define SD_SPI_SCK       12
-#define SD_SPI_FREQ_KHZ  10000
+#define SD_SPI_FREQ_KHZ  20000
 
 /*
  * Allocate the psmalloc arena from the SPIRAM heap rather than using the raw

@@ -8,6 +8,7 @@
 
 #ifdef BUILD_ESP32
 #include "esp_attr.h"
+#include "timestamp_stdio.h"
 #endif
 
 #ifndef IRAM_ATTR_CPU_EXEC1
