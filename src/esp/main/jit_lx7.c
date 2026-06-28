@@ -1463,6 +1463,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     /* Pass 2: Translate and emit Xtensa instructions */
     CmpState cs   = {0};
     int      emitted_bytes = 0;
+    int      emitted_insns = 0;
     bool     ok   = true;
     cur_eip = eip;
 
@@ -1474,6 +1475,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         if (!ok) break;
 
         emitted_bytes += bytes;
+        emitted_insns++;
         cur_eip       += bytes;
 
 #if TINY386_JIT_SINGLE_INSN_BLOCK
@@ -1506,6 +1508,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     block->host_code    = pool_start;
     block->host_len     = (uint16_t)(p - code_start);
     block->x86_len      = (uint16_t)emitted_bytes;
+    block->x86_insns    = (uint16_t)emitted_insns;
     block->status       = JIT_VALID;
 
 #ifdef BUILD_ESP32
@@ -1561,7 +1564,7 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     typedef void (*JITFunc)(CPUI386 *);
     JITFunc fn = (JITFunc)(void *)block->host_code;
     fn(cpu);
-    return block->x86_len;
+    return block->x86_insns;
 #else
     (void)block;
     return 0;

@@ -100,6 +100,7 @@ typedef struct {
     uint8_t  *host_code;    /* pointer into jit_pool[]            */
     uint16_t  host_len;     /* bytes of LX7 code                  */
     uint16_t  x86_len;      /* bytes consumed in x86 stream       */
+    uint16_t  x86_insns;    /* guest instructions consumed        */
     JITStatus status;
 } JITBlock;
 
@@ -130,10 +131,9 @@ void jit_init(JITState *jit, uint8_t *iram_pool);
 /**
  * jit_try_execute() — attempt to run a JIT-compiled block.
  *
- * Returns true  if a compiled block was found and executed;
- *         false if the block is not cached (caller should interpret).
- *
- * On a true return cpu->next_ip has already been advanced past the block.
+ * Returns the number of guest instructions executed, or 0 if the block is not
+ * cached/translatable and the caller should interpret.  On a non-zero return,
+ * cpu->next_ip has already been advanced past the block.
  */
 int jit_try_execute(JITState *jit, CPUI386 *cpu);
 
