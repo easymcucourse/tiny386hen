@@ -499,6 +499,7 @@ typedef enum {
     ACT_JCC,        /* conditional jump;   target_eip set */
     ACT_CWDE,       /* EAX = sign_extend(AX), no flags */
     ACT_CDQ,        /* EDX = sign_extend(EAX), no flags */
+    ACT_XCHG_EAX_R, /* swap EAX with another GPR, no flags */
     ACT_BLOCK_END,  /* last instruction of block, no jump */
 } ActionType;
 
@@ -551,6 +552,12 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
 
     if (op == 0x90) {
         a->type = ACT_NOP;
+        return len;
+    }
+
+    if (op >= 0x91 && op <= 0x97) {
+        a->type = ACT_XCHG_EAX_R;
+        a->src  = op & 7;
         return len;
     }
 
@@ -804,6 +811,13 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     case ACT_CDQ:
         GUARD(3);
         emit_srai(p, X86REG_TO_LX7(2), X86REG_TO_LX7(0), 31);
+        break;
+
+    case ACT_XCHG_EAX_R:
+        GUARD(6);
+        emit_mov(p, t0, X86REG_TO_LX7(0));
+        emit_mov(p, X86REG_TO_LX7(0), sr);
+        emit_mov(p, sr, t0);
         break;
 
     /* ---- MOV ------------------------------------------------ */
@@ -1089,6 +1103,8 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CWDE)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CDQ)
+        return true;
+    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_XCHG_EAX_R)
         return true;
     /*
      * Keep DEC disabled until the emitter preserves x86 lazy flags correctly.
