@@ -7,6 +7,9 @@
 
 #ifdef BUILD_ESP32
 #include "esp_attr.h"
+#ifdef TINY386_ENABLE_JIT
+#include "jit_lx7.h"
+#endif
 #define noinline __attribute__((noinline))
 #else
 #define IRAM_ATTR
@@ -117,6 +120,10 @@ struct CPUI386 {
 	struct {
 		uword cs, eip, esp;
 	} sysenter;
+
+#if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
+	JITState jit;
+#endif
 };
 
 #define dolog(...) fprintf(stderr, __VA_ARGS__)
@@ -5144,6 +5151,14 @@ void IRAM_ATTR_CPU_EXEC1 cpui386_step(CPUI386 *cpu, int stepcount)
 		return;
 	}
 
+#if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
+	if (jit_try_execute(&cpu->jit, cpu)) {
+		cpu->cycle++;
+		cpu->ifetch.paddr = 0;
+		return;
+	}
+#endif
+
 	int ret = cpu_exec1(cpu, stepcount);
 	cpu->ifetch.paddr = 0;
 	if (!ret) {
@@ -5275,6 +5290,36 @@ long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)
 	return cpu->cycle;
 }
 
+bool cpui386_is_code16(CPUI386 *cpu)
+{
+	return cpu->code16;
+}
+
+u32 cpui386_get_cs_base(CPUI386 *cpu)
+{
+	return cpu->seg[SEG_CS].base;
+}
+
+u32 cpui386_get_next_ip(CPUI386 *cpu)
+{
+	return cpu->next_ip;
+}
+
+u32 cpui386_get_cr0(CPUI386 *cpu)
+{
+	return cpu->cr0;
+}
+
+long cpui386_get_phys_mem_size(CPUI386 *cpu)
+{
+	return cpu->phys_mem_size;
+}
+
+u8 *cpui386_get_phys_mem(CPUI386 *cpu)
+{
+	return cpu->phys_mem;
+}
+
 CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 {
 	CPUI386 *cpu = malloc(sizeof(CPUI386));
@@ -5309,6 +5354,10 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	cpu->fpu = NULL;
 
 	cpui386_reset(cpu);
+
+#if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
+	jit_init(&cpu->jit, NULL);
+#endif
 
 	memset(&(cpu->cb), 0, sizeof(CPU_CB));
 	if (cb)

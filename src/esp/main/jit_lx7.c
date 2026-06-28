@@ -40,11 +40,21 @@
 #include <string.h>
 #include <stddef.h>
 
+extern const uint8_t jit_lx7_mov_rr_a3_a10[8][8][2];
+
+#ifndef TINY386_JIT_LEVEL
+#define TINY386_JIT_LEVEL 0
+#endif
+
+#ifndef TINY386_JIT_SINGLE_INSN_BLOCK
+#define TINY386_JIT_SINGLE_INSN_BLOCK 0
+#endif
+
 #ifdef BUILD_ESP32
 #  include "esp_attr.h"
    /* Static IRAM pool – the linker places this in instruction-accessible RAM */
-   static uint8_t IRAM_ATTR s_jit_pool[JIT_POOL_SIZE];
-#  define JIT_DEFAULT_POOL s_jit_pool
+   static uint32_t IRAM_ATTR s_jit_pool_words[(JIT_POOL_SIZE + 3) / 4];
+#  define JIT_DEFAULT_POOL ((uint8_t *)s_jit_pool_words)
 #else
 #  define JIT_DEFAULT_POOL NULL  /* JIT disabled on non-ESP32 targets */
 #endif
@@ -113,7 +123,19 @@ static inline void emit_neg(EmitPtr *p, int r, int t)
 
 /* MOV ar, as  (implemented as OR ar, as, as) */
 static inline void emit_mov(EmitPtr *p, int r, int s)
-{ emit_or(p, r, s, s); }
+{
+    if ((unsigned)(r - 3) < 8u && (unsigned)(s - 3) < 8u) {
+        const uint8_t *code = jit_lx7_mov_rr_a3_a10[r - 3][s - 3];
+        (*p)[0] = code[0];
+        (*p)[1] = code[1];
+        *p += 2;
+        return;
+    }
+
+    (*p)[0] = (uint8_t)((r << 4) | 0x0D);
+    (*p)[1] = (uint8_t)s;
+    *p += 2;
+}
 
 /* SSL as  — load SAR = (32 - as) for left shifts */
 static inline void emit_ssl(EmitPtr *p, int s)
@@ -273,10 +295,10 @@ static inline void emit_movi(EmitPtr *p, int t, int imm12)
 
 /* ---- CALL format: J offset18 ------------------------------------ */
 /*
- * J target: newPC = ((PC+4)&~3) + sign_extend(off18)<<2
- *   off18 = (target - ((pc+4)&~3)) >> 2
+ * J target: newPC = PC + 4 + sign_extend(off18)
+ *   off18 = target - (pc + 4)
  *
- * Encoding (TODO: validate with cross-compiled binary):
+ * Encoding:
  *   bits[5:0]  = 0b000110 = 6
  *   bits[23:6] = off18[17:0]
  */
@@ -289,6 +311,12 @@ static inline void emit_j(EmitPtr *p, int32_t off18)
     *p += 3;
 }
 
+static inline void emit_j_target(EmitPtr *p, const uint8_t *target)
+{
+    const uint8_t *pc = *p;
+    emit_j(p, (int32_t)(target - (pc + 4)));
+}
+
 /* SRLI for shift amounts 16-31 (uses MOVI + SSR + SRL, 9 bytes) */
 static void emit_ssri_wide(EmitPtr *p, int r, int sa)
 {
@@ -298,14 +326,21 @@ static void emit_ssri_wide(EmitPtr *p, int r, int sa)
 }
 
 /* ---- RET0: return from CALL0-called function -------------------- */
-static inline void emit_ret0(EmitPtr *p)
+static inline void emit_retw(EmitPtr *p)
 {
     /* JX a0  — jump to the address stored in a0 (the return address) */
     /* op2=0, op1=0xA, r=0, s=0 (a0), t=0; op0=0  → RRR             */
     /* From ISA: JX at is op2=0 & op1=0xA & at & ar=0 & as=0 & op0=0 */
-    (*p)[0] = 0xA0;  /* op1=0xA, op0=0 */
-    (*p)[1] = 0x00;  /* s=0, t=0 (a0 is source) */
-    (*p)[2] = 0x00;  /* op2=0, r=0 */
+    (*p)[0] = 0x1D;
+    (*p)[1] = 0xF0;
+    *p += 2;
+}
+
+static inline void emit_entry32(EmitPtr *p)
+{
+    (*p)[0] = 0x36;
+    (*p)[1] = 0x41;
+    (*p)[2] = 0x00;
     *p += 3;
 }
 
@@ -317,15 +352,13 @@ static inline void emit_ret0(EmitPtr *p)
  *   byte[2] = imm16_hi
  *
  * To load a 32-bit constant we emit:
- *   L32R  at, .Lpool_entry   ; 3 bytes
- *   J     .Lafter            ; 3 bytes  (skip over literal)
+ *   J     .Lafter_literal    ; 3 bytes  (skip over literal)
  *   .word imm32              ; 4 bytes, 4-byte aligned
- * .Lafter:
+ * .Lafter_literal:
+ *   L32R  at, .Lpool_entry   ; 3 bytes, loads backward literal
  *
- * For simplicity we always align the pool to 4 bytes and keep it
- * inline.  The caller must ensure the emit buffer is large enough.
- *
- * Returns the number of bytes written (10 + up to 1 alignment pad).
+ * LX7 accepts this backward literal form; forward inline literals were
+ * observed to assemble out of range on the ESP32-S3 toolchain.
  */
 static int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
 {
@@ -338,22 +371,7 @@ static int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
         return (int)(*p - start);
     }
 
-    /*
-     * L32R   at, pool   -- offset computed after alignment
-     * J      after      -- skip literal
-     * (pad)
-     * .word  imm32
-     * after:
-     *
-     * LX7 L32R offset is (pool_addr - ((l32r_pc+3)&~3)) / 4 - 1
-     *   pc_l32r   = current *p
-     *   next_pc   = pc_l32r + 3
-     *   aligned   = (next_pc + 3) & ~3           (next 4B aligned after J)
-     *   pool_addr = aligned (we place literal right after J)
-     *   We emit: L32R(3) + J(3) + pad(0-3) + literal(4)
-     */
-    uint8_t *pc_l32r = *p;
-    *p += 3; /* reserve L32R */
+    uint8_t *pc_j = *p;
     *p += 3; /* reserve J to skip literal */
 
     /* Align to 4 bytes for the literal */
@@ -369,27 +387,19 @@ static int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
     (*p)[3] = (uint8_t)((imm32 >> 24) & 0xFF);
     *p += 4;
 
-    uint8_t *after = *p;
+    uint8_t *pc_l32r = *p;
+    *p += 3; /* reserve L32R */
 
-    /* Back-patch L32R: offset = (pool - ((pc_l32r+3)&~3)) / 4 - 1 */
-    uintptr_t aligned_next = ((uintptr_t)pc_l32r + 3 + 3) & ~(uintptr_t)3;
-    int32_t l32r_off = (int32_t)(((uintptr_t)pool - aligned_next) / 4);
-    /* l32r_off is negative (pool is *before* aligned_next? No — pool is after J) */
-    /* Actually for L32R, offset is measured *backward* from aligned(PC+3):       */
-    /* new_off = (pool_addr - aligned_next) / 4  (negative means forward? No)     */
-    /* Xtensa L32R: EA = ((PC+3)&~3) + (sign_extend16(imm16) << 2)                */
-    /* We want EA = pool, so imm16 = (pool - ((pc_l32r+3)&~3)) / 4                */
-    int32_t l32r_imm16 = (int32_t)(((uintptr_t)pool - aligned_next) / 4);
+    /* Back-patch J: off18 is a signed byte offset from pc + 4. */
+    EmitPtr pj = pc_j;
+    emit_j_target(&pj, pc_l32r);
+
+    /* Back-patch L32R: EA = ((PC + 3) & ~3) + (sign_extend16(imm16) << 2). */
+    uintptr_t aligned_pc = ((uintptr_t)pc_l32r + 3) & ~(uintptr_t)3;
+    int32_t l32r_imm16 = (int32_t)(((uintptr_t)pool - aligned_pc) / 4);
     pc_l32r[0] = (uint8_t)((t << 4) | 0x1);
     pc_l32r[1] = (uint8_t)(l32r_imm16 & 0xFF);
     pc_l32r[2] = (uint8_t)((l32r_imm16 >> 8) & 0xFF);
-
-    /* Back-patch J: off18 = (after - ((j_pc+4)&~3)) / 4 */
-    uint8_t *pc_j = pc_l32r + 3;
-    uintptr_t j_base = ((uintptr_t)pc_j + 4 + 3) & ~(uintptr_t)3;
-    int32_t j_off18  = (int32_t)(((uintptr_t)after - j_base) / 4);
-    EmitPtr pj = pc_j;
-    emit_j(&pj, j_off18);
 
     return (int)(*p - start);
 }
@@ -412,6 +422,7 @@ static int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
 /* Emit prologue: load all 8 x86 GPRs from cpu->gprx[] */
 static void emit_prologue(EmitPtr *p, int cpu_reg)
 {
+    emit_entry32(p);
     for (int i = 0; i < 8; i++) {
         /* L32I a(LX7_GPR_BASE+i), a(cpu_reg), GPR_OFF(i)/4 */
         emit_l32i(p, LX7_GPR_BASE + i, cpu_reg, GPR_OFF(i) / 4);
@@ -427,7 +438,7 @@ static void emit_epilogue(EmitPtr *p, int cpu_reg, uint32_t next_ip)
     /* Set cpu->next_ip = next_ip */
     emit_movi32(p, LX7_TMP0, next_ip);
     emit_s32i(p, LX7_TMP0, cpu_reg, NEXT_IP_OFF / 4);
-    emit_ret0(p);
+    emit_retw(p);
 }
 
 /* ================================================================== */
@@ -470,20 +481,21 @@ static inline ModRM decode_modrm(uint8_t b)
 
 typedef enum {
     ACT_NONE,
-    ACT_MOV_RR,     /* dst_reg = src_reg */
+    ACT_NOP,        /* no-op; only advances next_ip; 30s serial smoke test passed. */
+    ACT_MOV_RR,     /* dst_reg = src_reg; failed in level2 tests, see jit_action_enabled(). */
     ACT_MOV_RI,     /* dst_reg = imm32 */
     ACT_ALU_RR,     /* dst_reg op= src_reg  (ADD/SUB/AND/OR/XOR) */
     ACT_ALU_RI,     /* dst_reg op= imm32    (8 or 32-bit) */
     ACT_NOT_R,      /* dst_reg = ~dst_reg */
     ACT_NEG_R,      /* dst_reg = -dst_reg */
-    ACT_INC_R,      /* dst_reg += 1 */
-    ACT_DEC_R,      /* dst_reg -= 1 */
+    ACT_INC_R,      /* dst_reg += 1; failed because x86 flags are not updated yet. */
+    ACT_DEC_R,      /* dst_reg -= 1; failed because x86 flags are not updated yet. */
     ACT_SHx_RI,     /* shift dst_reg by imm5 (SHL/SHR/SAR) */
     ACT_SHx_CL,     /* shift dst_reg by CL   (SHL/SHR/SAR) */
     ACT_CMP_RR,     /* set cmp state: left_reg CMP right_reg */
     ACT_CMP_RI,     /* set cmp state: left_reg CMP imm32 */
     ACT_TEST_RR,    /* set test state: left_reg & right_reg */
-    ACT_JMP,        /* unconditional jump; target_eip set */
+    ACT_JMP,        /* unconditional jump; failed in BIOS relocation tests; needs tracing. */
     ACT_JCC,        /* conditional jump;   target_eip set */
     ACT_BLOCK_END,  /* last instruction of block, no jump */
 } ActionType;
@@ -535,6 +547,11 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
         op == 0xF0 || op == 0xF2 || op == 0xF3)
         return 0;
 
+    if (op == 0x90) {
+        a->type = ACT_NOP;
+        return len;
+    }
+
     /* ── MOV r32, imm32   (B8+r id) ─────────────────────────── */
     if (op >= 0xB8 && op <= 0xBF) {
         a->type = ACT_MOV_RI;
@@ -546,6 +563,16 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
     }
 
     /* ── INC r32 / DEC r32  (40-4F) ─────────────────────────── */
+    /*
+     * INC/DEC decode is correct, but enabling these actions is not safe yet.
+     * Real x86 INC/DEC update OF/SF/ZF/AF/PF while preserving CF. The current
+     * JIT emitter only changes the GPR, so BIOS code that branches on flags
+     * after INC/DEC can diverge from the interpreter.
+     *
+     * Observed failures:
+     *   - INC-only: WDT after the SeaBIOS PCI/MPTABLE area.
+     *   - DEC-only: WDT around/after "Relocating init ...".
+     */
     if (op >= 0x40 && op <= 0x47) {
         a->type = ACT_INC_R; a->dst = op - 0x40; return len;
     }
@@ -582,6 +609,14 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
     }
 
     /* ── MOV r/m32, r32  (89)  /  MOV r32, r/m32  (8B) ──────── */
+    /*
+     * Register-only MOV has no x86 flag side effects, so it should be an easy
+     * JIT action. In practice level2 MOV_RR-only tests still tripped WDT after
+     * the SeaBIOS PCI/MPTABLE area, even after verifying the Xtensa mov.n bytes
+     * with an assembler-generated table. Treat this as unresolved: likely an
+     * interaction with block caching, stale translation, register save/restore,
+     * or another interpreter/JIT state mismatch.
+     */
     if (op == 0x89 || op == 0x8B) {
         ModRM m = decode_modrm(src[len++]);
         if (!m.reg_only) return 0;
@@ -653,20 +688,30 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
     }
 
     /* ── JMP rel8  (EB cb) ───────────────────────────────────── */
+    /*
+     * JMP target arithmetic uses 32-bit wraparound and emit_j_target() uses
+     * the Xtensa assembler-confirmed rule target - (pc + 4). Even so, JMP-only
+     * tests WDT during SeaBIOS relocation. Do not re-enable blindly; first add
+     * a trace that compares decoded target_eip with interpreter execution.
+     */
     if (op == 0xEB) {
         int8_t rel = (int8_t)src[len++];
         a->type       = ACT_JMP;
-        a->target_eip = (uint32_t)((int32_t)(eip + len) + rel);
+        a->target_eip = eip + (uint32_t)len + (uint32_t)(int32_t)rel;
         return len;
     }
 
     /* ── JMP rel32  (E9 cd) ──────────────────────────────────── */
+    /*
+     * Same failure status as rel8 JMP above. The decoder is kept so target
+     * tracing can be added without rediscovering the instruction format.
+     */
     if (op == 0xE9) {
         int32_t rel = (int32_t)((uint32_t)src[len]     | ((uint32_t)src[len+1] << 8) |
                                 ((uint32_t)src[len+2] << 16) | ((uint32_t)src[len+3] << 24));
         len += 4;
         a->type       = ACT_JMP;
-        a->target_eip = (uint32_t)((int32_t)(eip + len) + rel);
+        a->target_eip = eip + (uint32_t)len + (uint32_t)rel;
         return len;
     }
 
@@ -735,9 +780,19 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
     switch (a->type) {
 
+    case ACT_NOP:
+        break;
+
     /* ---- MOV ------------------------------------------------ */
     case ACT_MOV_RR:
-        GUARD(3); emit_mov(p, dr, sr); break;
+        /*
+         * Failed as a runtime action, not as an Xtensa encoding problem.
+         * mov.n encodings were checked against jit_lx7_mov_rr.S, but the
+         * firmware still hit WDT in level2 MOV_RR-only testing. Keep this
+         * emitter for controlled experiments only until the state mismatch is
+         * found with translation/execution tracing.
+         */
+        GUARD(2); emit_mov(p, dr, sr); break;
 
     case ACT_MOV_RI:
         GUARD(16); emit_movi32(p, dr, (uint32_t)a->imm); break;
@@ -788,9 +843,17 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         GUARD(3); emit_neg(p, dr, dr); break;
 
     case ACT_INC_R:
+        /*
+         * Known-bad when enabled by itself: updates the register but not x86
+         * EFLAGS. INC must update OF/SF/ZF/AF/PF and preserve CF.
+         */
         GUARD(3); emit_addi(p, dr, dr, 1); break;
 
     case ACT_DEC_R:
+        /*
+         * Known-bad when enabled by itself: same flag problem as INC. DEC must
+         * update OF/SF/ZF/AF/PF and preserve CF.
+         */
         GUARD(3); emit_addi(p, dr, dr, -1); break;
 
     /* ---- Shifts -------------------------------------------- */
@@ -848,8 +911,14 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
     /* ---- Unconditional jump --------------------------------- */
     case ACT_JMP:
-        /* Epilogue with target as next_ip, then J is not needed
-         * because emit_epilogue ends with RET0 back to C caller. */
+        /*
+         * Failed in JMP-only firmware tests. The epilogue stores target_eip as
+         * next_ip and returns to C; no host-side J is needed here. The suspect
+         * is not the local epilogue structure alone, because rel target math
+         * and Xtensa J encoding were checked separately. Before enabling this
+         * again, trace the first translated JMPs and compare target_eip against
+         * the interpreter path.
+         */
         GUARD(16 * 4);
         emit_epilogue(p, cpu_reg, a->target_eip);
         break;
@@ -889,7 +958,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
         if (cs->cmp_mode == 0) {
             /* No pending CMP; treat as JMP (unconditional) for safety */
-            emit_j(&bp, (int32_t)((taken_start - (branch_site + 4)) / 4));
+            emit_j_target(&bp, taken_start);
             break;
         }
 
@@ -919,7 +988,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         case CC_NS:  emit_bgez(&bp, zreg, br_off & 0xFFF); break;
         /* LE / NBE and overflow (CC_O/CC_NO/CC_BE/CC_NBE) need multi-
          * step flag arithmetic; emit a plain J as conservative fallback */
-        default: emit_j(&bp, (int32_t)((taken_start - (branch_site + 4)) / 4)); break;
+        default: emit_j_target(&bp, taken_start); break;
         }
         cs->cmp_mode = 0;
         break;
@@ -947,10 +1016,89 @@ static inline uint32_t jit_hash(uint32_t paddr)
     return (paddr * 2654435761u) % JIT_CACHE_ENTRIES;
 }
 
+static inline uint32_t jit_align4(uint32_t v)
+{
+    return (v + 3u) & ~3u;
+}
+
+static bool jit_action_enabled(const X86Action *a, int block_insn_index)
+{
+    /*
+     * JIT bring-up status on ESP32-S3 / COM19, 2026-06-28:
+     *
+     *   ACT_NOP:
+     *     Passed a 30s serial smoke test. The guest reached hard-disk boot and
+     *     VGA mode 1 without WDT. This proves the call path, entry/retw ABI,
+     *     basic prologue/epilogue, IRAM copy, and next_ip advance can work.
+     *
+     *   ACT_MOV_RI:
+     *     Earlier level1 tests were stable, but it has not been re-tested after
+     *     the later entry/retw, IRAM copy, and emitter changes. Re-test as a
+     *     single enabled action before treating it as a baseline.
+     *
+     *   ACT_MOV_RR:
+     *     Failed in level2 and MOV_RR-only tests with WDT after the SeaBIOS
+     *     PCI/MPTABLE area. The Xtensa mov.n bytes were verified with the
+     *     assembler table in jit_lx7_mov_rr.S, so this is probably not a simple
+     *     instruction encoding bug. Needs execution tracing/state comparison.
+     *
+     *   ACT_JMP:
+     *     Failed in JMP-only tests, usually during "Relocating init ...".
+     *     rel8/rel32 target arithmetic and Xtensa J offset semantics were
+     *     checked, but the firmware still diverges. Needs first-N-JMP tracing.
+     *
+     *   ACT_INC_R / ACT_DEC_R:
+     *     Failed when each was enabled alone. The current emitter only changes
+     *     the GPR and does not update EFLAGS. Correct x86 INC/DEC must update
+     *     OF/SF/ZF/AF/PF and preserve CF, or be emitted only when flags are
+     *     provably dead.
+     *
+     * Keep this gate intentionally conservative. Decode/emitter support below
+     * is retained for isolated experiments, but an action should only be
+     * enabled here after a boot smoke test.
+     */
+    (void)block_insn_index;
+
+    if (TINY386_JIT_LEVEL <= 0)
+        return false;
+    /*
+     * Keep DEC disabled until the emitter preserves x86 lazy flags correctly.
+     * DEC-only firmware tests WDT around SeaBIOS relocation.
+     */
+    if (TINY386_JIT_LEVEL >= 3 && a->type == ACT_MOV_RR)
+        return true;
+    return false;
+}
+
+#ifdef BUILD_ESP32
+static void jit_copy_to_iram(uint8_t *dst, const uint8_t *src, uint32_t len)
+{
+    volatile uint32_t *dw = (volatile uint32_t *)dst;
+    uint32_t words = jit_align4(len) / 4;
+    for (uint32_t i = 0; i < words; i++) {
+        uint32_t off = i * 4;
+        uint32_t v = 0;
+        if (off + 0 < len)
+            v |= (uint32_t)src[off + 0];
+        if (off + 1 < len)
+            v |= (uint32_t)src[off + 1] << 8;
+        if (off + 2 < len)
+            v |= (uint32_t)src[off + 2] << 16;
+        if (off + 3 < len)
+            v |= (uint32_t)src[off + 3] << 24;
+        dw[i] = v;
+    }
+}
+#endif
+
 void jit_init(JITState *jit, uint8_t *iram_pool)
 {
     memset(jit, 0, sizeof(*jit));
+#ifdef BUILD_ESP32
+    jit->pool = iram_pool ? iram_pool : JIT_DEFAULT_POOL;
+#else
     jit->pool = iram_pool;
+#endif
 }
 
 void jit_invalidate_all(JITState *jit)
@@ -1012,14 +1160,17 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         block->status = JIT_EMPTY;
 
     /* Allocate space in the code pool */
+    jit->pool_used = jit_align4(jit->pool_used);
     if (jit->pool_used + JIT_BLOCK_MAXBYTES > JIT_POOL_SIZE) {
         /* Pool full: flush everything and restart */
         jit_invalidate_all(jit);
     }
 
-    uint8_t  *code_start = jit->pool + jit->pool_used;
-    uint8_t  *code_end   = code_start + JIT_BLOCK_MAXBYTES;
-    EmitPtr   p          = code_start;
+    uint8_t  *pool_start = jit->pool + jit->pool_used;
+    uint8_t   tmp_code[JIT_BLOCK_MAXBYTES] __attribute__((aligned(4)));
+    uint8_t  *code_start = tmp_code;
+    uint8_t  *code_end   = tmp_code + JIT_BLOCK_MAXBYTES;
+    EmitPtr   p          = tmp_code;
 
     /* Emit prologue: load x86 GPRs into LX7 registers */
     emit_prologue(&p, LX7_CPU_REG);
@@ -1033,6 +1184,8 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     for (int n = 0; n < JIT_SCAN_LIMIT; n++) {
         X86Action a;
         int bytes = decode_x86_insn(x86 + x86_consumed, cur_eip, &a);
+        if (bytes != 0 && !jit_action_enabled(&a, n))
+            bytes = 0;
         if (bytes == 0) {
             /* Unhandled: emit epilogue up to here and stop */
             if (n == 0) {
@@ -1053,6 +1206,11 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
         x86_consumed += bytes;
         cur_eip      += bytes;
+
+#if TINY386_JIT_SINGLE_INSN_BLOCK
+        emit_epilogue(&p, LX7_CPU_REG, cur_eip);
+        break;
+#endif
 
         /* Block-terminating instructions end the translation */
         if (a.type == ACT_JMP || a.type == ACT_JCC || a.type == ACT_BLOCK_END)
@@ -1080,18 +1238,15 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     /* Commit block */
     block->guest_paddr  = paddr;
     block->guest_cs_base= cs_base;
-    block->host_code    = code_start;
+    block->host_code    = pool_start;
     block->host_len     = (uint16_t)(p - code_start);
     block->x86_len      = (uint16_t)x86_consumed;
     block->status       = JIT_VALID;
 
-    jit->pool_used += (uint32_t)(p - code_start);
-
-    /*
-     * No cache flush needed: s_jit_pool lives in IRAM, which is directly
-     * accessible on both the instruction and data buses without going
-     * through DCache or ICache.  Writes are immediately visible to the CPU.
-     */
+#ifdef BUILD_ESP32
+    jit_copy_to_iram(pool_start, code_start, block->host_len);
+#endif
+    jit->pool_used += jit_align4(block->host_len);
 
     return block;
 }

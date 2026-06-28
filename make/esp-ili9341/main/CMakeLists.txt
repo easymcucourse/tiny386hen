@@ -6,6 +6,8 @@ set(TINY386_CORE_SOURCES
     "${TINY386_ESP_SRC_ROOT}/adlib.c"
     "${TINY386_REF_ROOT}/fpu.c"
     "${TINY386_OVERLAY_ROOT}/i386.c"
+    "${TINY386_ESP_SRC_ROOT}/jit_lx7.c"
+    "${TINY386_ESP_SRC_ROOT}/jit_lx7_mov_rr.S"
     "${TINY386_REF_ROOT}/i8042.c"
     "${TINY386_REF_ROOT}/i8254.c"
     "${TINY386_REF_ROOT}/i8259.c"
@@ -79,6 +81,7 @@ set_source_files_properties("${EMU8950_SRC_ROOT}/emu8950.c" PROPERTIES COMPILE_F
 set_source_files_properties("${EMU8950_SRC_ROOT}/emuadpcm.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_REF_ROOT}/fpu.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_OVERLAY_ROOT}/i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
+set_source_files_properties("${TINY386_ESP_SRC_ROOT}/jit_lx7.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("${TINY386_REF_ROOT}/i8042.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_ESP_SRC_ROOT}/vga.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("${TINY386_OVERLAY_ROOT}/pc.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")

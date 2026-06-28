@@ -39,6 +39,8 @@
 #define PC_KBD_STEP_DIV 2
 #define PC_DMA_STEP_DIV 2
 #define PC_SERIAL_STEP_DIV 2
+#define TINY386_ENABLE_JIT 1
+#define TINY386_JIT_LEVEL 2
 
 /* Network is disabled on this board; omit NE2000 state and runtime work. */
 #define TINY386_NO_NE2000 1
