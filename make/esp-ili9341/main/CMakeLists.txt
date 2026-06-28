@@ -1,5 +1,6 @@
 set(TINY386_ESP_SRC_ROOT "${TINY386HEN_SRC_ROOT}/esp/main")
 set(TINY386_OVERLAY_ROOT "${TINY386HEN_SRC_ROOT}/tiny386")
+set(EMU8950_SRC_ROOT "${TINY386HEN_SRC_ROOT}/emu8950")
 
 set(TINY386_CORE_SOURCES
     "${TINY386_ESP_SRC_ROOT}/adlib.c"
@@ -18,8 +19,8 @@ set(TINY386_CORE_SOURCES
     "${TINY386_REF_ROOT}/i8257.c"
     "${TINY386_REF_ROOT}/sb16.c"
     "${TINY386_REF_ROOT}/pcspk.c"
-    "${EMU8950_REF_ROOT}/emu8950.c"
-    "${EMU8950_REF_ROOT}/emuadpcm.c"
+    "${EMU8950_SRC_ROOT}/emu8950.c"
+    "${EMU8950_SRC_ROOT}/emuadpcm.c"
 )
 
 idf_component_register(
@@ -38,7 +39,7 @@ idf_component_register(
         "${TINY386_ESP_SRC_ROOT}"
         "${TINY386_OVERLAY_ROOT}"
         "${TINY386_REF_ROOT}"
-        "${EMU8950_REF_ROOT}"
+        "${EMU8950_SRC_ROOT}"
     REQUIRES
         driver
         esp_driver_gpio
@@ -58,7 +59,7 @@ message(STATUS "Building tiny386hen ESP overlay for BOARD=${BOARD}")
 message(STATUS "Using ESP glue from ${TINY386_ESP_SRC_ROOT}")
 message(STATUS "Using tiny386 overlays from ${TINY386_OVERLAY_ROOT}")
 message(STATUS "Using tiny386 refs from ${TINY386_REF_ROOT}")
-message(STATUS "Using emu8950 refs from ${EMU8950_REF_ROOT}")
+message(STATUS "Using emu8950 sources from ${EMU8950_SRC_ROOT}")
 
 add_definitions(-include ${TINY386_ESP_SRC_ROOT}/board_${BOARD}.h)
 add_definitions(-DI386_ENABLE_FPU)
@@ -74,8 +75,8 @@ target_link_options(${COMPONENT_LIB} INTERFACE
     -Wl,--wrap=fclose)
 
 set_source_files_properties("${TINY386_ESP_SRC_ROOT}/adlib.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
-set_source_files_properties("${EMU8950_REF_ROOT}/emu8950.c" PROPERTIES COMPILE_FLAGS "-Wno-all -fsingle-precision-constant")
-set_source_files_properties("${EMU8950_REF_ROOT}/emuadpcm.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
+set_source_files_properties("${EMU8950_SRC_ROOT}/emu8950.c" PROPERTIES COMPILE_FLAGS "-Wno-all -fsingle-precision-constant")
+set_source_files_properties("${EMU8950_SRC_ROOT}/emuadpcm.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_REF_ROOT}/fpu.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_OVERLAY_ROOT}/i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("${TINY386_REF_ROOT}/i8042.c" PROPERTIES COMPILE_FLAGS "-Wno-all")

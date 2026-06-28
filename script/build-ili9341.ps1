@@ -54,85 +54,6 @@ function Invoke-Checked {
     }
 }
 
-function Invoke-GitQuiet {
-    param(
-        [string[]]$GitArgs
-    )
-
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        & git @GitArgs >$null 2>$null
-        return $LASTEXITCODE
-    }
-    finally {
-        $ErrorActionPreference = $previous
-    }
-}
-
-function Get-RelativePath {
-    param(
-        [string]$FromDirectory,
-        [string]$ToPath
-    )
-
-    $from = (Resolve-Path -LiteralPath $FromDirectory).Path
-    $to = (Resolve-Path -LiteralPath $ToPath).Path
-    if (!$from.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
-        $from += [System.IO.Path]::DirectorySeparatorChar
-    }
-
-    $fromUri = [System.Uri]::new($from)
-    $toUri = [System.Uri]::new($to)
-    return [System.Uri]::UnescapeDataString($fromUri.MakeRelativeUri($toUri).ToString()).Replace("/", [System.IO.Path]::DirectorySeparatorChar)
-}
-
-function Apply-SubmodulePatch {
-    param(
-        [string]$SubmodulePath,
-        [string]$PatchPath
-    )
-
-    if (!(Test-Path $PatchPath)) {
-        throw "Missing submodule patch: $PatchPath"
-    }
-
-    if (!(Test-Path $SubmodulePath)) {
-        throw "Missing submodule path: $SubmodulePath"
-    }
-
-    $resolvedPatch = (Resolve-Path -LiteralPath $PatchPath).Path
-    $displayPatch = Get-RelativePath $SubmodulePath $PatchPath
-    $checkExit = Invoke-GitQuiet -GitArgs @("-C", $SubmodulePath, "apply", "--check", $resolvedPatch)
-    if ($checkExit -eq 0) {
-        Invoke-Checked "apply submodule patch $displayPatch" {
-            git -C $SubmodulePath apply $resolvedPatch
-        }
-        return $true
-    }
-
-    $reverseCheckExit = Invoke-GitQuiet -GitArgs @("-C", $SubmodulePath, "apply", "--reverse", "--check", $resolvedPatch)
-    if ($reverseCheckExit -eq 0) {
-        Write-Host "submodule patch already applied: $displayPatch"
-        return $false
-    }
-
-    throw "Submodule patch does not apply cleanly: $displayPatch"
-}
-
-function Restore-SubmodulePatch {
-    param(
-        [string]$SubmodulePath,
-        [string]$PatchPath
-    )
-
-    $resolvedPatch = (Resolve-Path -LiteralPath $PatchPath).Path
-    $displayPatch = Get-RelativePath $SubmodulePath $PatchPath
-    Invoke-Checked "restore submodule patch $displayPatch" {
-        git -C $SubmodulePath apply --reverse $resolvedPatch
-    }
-}
-
 function Get-EsptoolCommand {
     $cmd = Get-Command esptool.py -ErrorAction SilentlyContinue
     $cmdPath = @($cmd.Path, $cmd.Source) | Where-Object { $_ } | Select-Object -First 1
@@ -171,23 +92,12 @@ if ($Clean -and (Test-Path $BuildPath)) {
     Remove-Item -LiteralPath $BuildPath -Recurse -Force
 }
 
-$appliedPatches = @()
-$emu8950Patch = Join-Path $Root "patches\submodules\0001-Place-ESP32-OPL-tables-in-external-BSS.patch"
-$emu8950Path = Join-Path $Root "refs\emu8950"
-
-if (Apply-SubmodulePatch $emu8950Path $emu8950Patch) {
-    $appliedPatches += [pscustomobject]@{ SubmodulePath = $emu8950Path; PatchPath = $emu8950Patch }
-}
-
 Push-Location $ProjectDir
 try {
     Invoke-Checked "idf.py build" { idf.py -B $BuildDir -DBOARD=ili9341 build }
 }
 finally {
     Pop-Location
-    for ($i = $appliedPatches.Count - 1; $i -ge 0; $i--) {
-        Restore-SubmodulePatch $appliedPatches[$i].SubmodulePath $appliedPatches[$i].PatchPath
-    }
 }
 
 $flasherArgsPath = Join-Path $BuildPath "flasher_args.json"

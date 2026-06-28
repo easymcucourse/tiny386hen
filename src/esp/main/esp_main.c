@@ -416,6 +416,8 @@ static int parse_ini(void* user, const char* section,
 				strcpy(conf->pass, value);
 		} else if (NAME("enable_usb")) {
 			conf->enable_usb = atoi(value);
+		} else if (NAME("volume") || NAME("audio_volume")) {
+			i2s_set_output_volume_percent(atoi(value));
 		}
 	}
 #undef SEC

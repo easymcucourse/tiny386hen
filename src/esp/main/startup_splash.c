@@ -55,6 +55,14 @@ static uint32_t read_u32(const void *p)
 	return v;
 }
 
+static void apply_volume(int16_t *samples, size_t count)
+{
+	if (i2s_output_volume_percent == 100)
+		return;
+	for (size_t i = 0; i < count; i++)
+		samples[i] = (int32_t)samples[i] * i2s_output_volume_percent / 100;
+}
+
 static bool resource_map(void)
 {
 	if (s_res_part)
@@ -215,6 +223,7 @@ bool startup_splash_play_wav(void *i2s_tx_chan)
 			free(i2s_dma_buf);
 			return false;
 		}
+		apply_volume((int16_t *)i2s_dma_buf, chunk / sizeof(int16_t));
 		if (i2s_channel_write(tx, i2s_dma_buf, chunk,
 				      &bwritten, portMAX_DELAY) != ESP_OK) {
 			free(i2s_dma_buf);

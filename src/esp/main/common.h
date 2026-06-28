@@ -14,6 +14,9 @@ struct Globals {
 
 extern EventGroupHandle_t global_event_group;
 extern struct Globals globals;
+extern int i2s_output_volume_percent;
+
+void i2s_set_output_volume_percent(int volume);
 
 #define TINY386_EVENT_PC_READY     BIT0
 #define TINY386_EVENT_SPLASH_DONE  BIT1
