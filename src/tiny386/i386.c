@@ -20,6 +20,13 @@
 #define I386_OPT2
 #endif
 
+#ifdef BUILD_ESP32
+#define IFETCH_CACHE_LINE_BITS 5
+#define IFETCH_CACHE_LINE_SIZE (1u << IFETCH_CACHE_LINE_BITS)
+#define IFETCH_CACHE_LINES 16
+#define IFETCH_CACHE_INVALID ((uword)-1)
+#endif
+
 #ifdef I386_ENABLE_FPU
 #include "fpu.h"
 #else
@@ -70,6 +77,10 @@ struct CPUI386 {
 		unsigned long laddr;
 		uword xaddr;
 		uword paddr;
+#ifdef BUILD_ESP32
+		uword cache_tag[IFETCH_CACHE_LINES];
+		u8 cache_data[IFETCH_CACHE_LINES][IFETCH_CACHE_LINE_SIZE];
+#endif
 	} ifetch;
 
 	struct {
@@ -213,8 +224,51 @@ static inline u8 pload8(CPUI386 *cpu, uword addr)
 	return cpu->phys_mem[addr];
 }
 
+#ifdef BUILD_ESP32
+static inline void ifetch_cache_init(CPUI386 *cpu)
+{
+	for (int i = 0; i < IFETCH_CACHE_LINES; i++)
+		cpu->ifetch.cache_tag[i] = IFETCH_CACHE_INVALID;
+}
+
+static inline void ifetch_cache_invalidate_range(CPUI386 *cpu,
+						 uword addr, int size)
+{
+	uword line = addr & ~(IFETCH_CACHE_LINE_SIZE - 1);
+	uword last = (addr + size - 1) & ~(IFETCH_CACHE_LINE_SIZE - 1);
+	for (;;) {
+		int idx = (line >> IFETCH_CACHE_LINE_BITS) &
+			(IFETCH_CACHE_LINES - 1);
+		if (cpu->ifetch.cache_tag[idx] == line)
+			cpu->ifetch.cache_tag[idx] = IFETCH_CACHE_INVALID;
+		if (line == last)
+			break;
+		line += IFETCH_CACHE_LINE_SIZE;
+	}
+}
+
+static inline u8 ifetch_cached_pload8(CPUI386 *cpu, uword addr)
+{
+	uword line = addr & ~(IFETCH_CACHE_LINE_SIZE - 1);
+	int idx = (line >> IFETCH_CACHE_LINE_BITS) & (IFETCH_CACHE_LINES - 1);
+	if (unlikely(line + IFETCH_CACHE_LINE_SIZE > (uword)cpu->phys_mem_size))
+		return pload8(cpu, addr);
+	if (unlikely(cpu->ifetch.cache_tag[idx] != line)) {
+		memcpy(cpu->ifetch.cache_data[idx], cpu->phys_mem + line,
+		       IFETCH_CACHE_LINE_SIZE);
+		cpu->ifetch.cache_tag[idx] = line;
+	}
+	return cpu->ifetch.cache_data[idx][addr & (IFETCH_CACHE_LINE_SIZE - 1)];
+}
+#else
+#define ifetch_cache_init(cpu) do {} while (0)
+#define ifetch_cache_invalidate_range(cpu, addr, size) do {} while (0)
+#define ifetch_cached_pload8(cpu, addr) pload8(cpu, addr)
+#endif
+
 static inline void pstore8(CPUI386 *cpu, uword addr, u8 val)
 {
+	ifetch_cache_invalidate_range(cpu, addr, 1);
 	cpu->phys_mem[addr] = val;
 }
 
@@ -237,6 +291,7 @@ static inline u32 pload32(CPUI386 *cpu, uword addr)
 
 static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
 {
+	ifetch_cache_invalidate_range(cpu, addr, 2);
 	struct { u16 v; } __attribute__((packed))
 		*q = (void *) &(cpu->phys_mem[addr]);
 	q->v = val;
@@ -244,6 +299,7 @@ static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
 
 static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
 {
+	ifetch_cache_invalidate_range(cpu, addr, 4);
 	struct { u32 v; } __attribute__((packed))
 		*q = (void *) &(cpu->phys_mem[addr]);
 	q->v = val;
@@ -261,11 +317,13 @@ static inline u32 pload32(CPUI386 *cpu, uword addr)
 
 static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
 {
+	ifetch_cache_invalidate_range(cpu, addr, 2);
 	*(u16 *)&(cpu->phys_mem[addr]) = val;
 }
 
 static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
 {
+	ifetch_cache_invalidate_range(cpu, addr, 4);
 	*(u32 *)&(cpu->phys_mem[addr]) = val;
 }
 #endif
@@ -285,17 +343,48 @@ static inline u32 pload32(CPUI386 *cpu, uword addr)
 
 static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
 {
+	ifetch_cache_invalidate_range(cpu, addr, 2);
 	cpu->phys_mem[addr] = val;
 	cpu->phys_mem[addr + 1] = val >> 8;
 }
 
 static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
 {
+	ifetch_cache_invalidate_range(cpu, addr, 4);
 	cpu->phys_mem[addr] = val;
 	cpu->phys_mem[addr + 1] = val >> 8;
 	cpu->phys_mem[addr + 2] = val >> 16;
 	cpu->phys_mem[addr + 3] = val >> 24;
 }
+#endif
+
+#ifdef BUILD_ESP32
+static inline u16 ifetch_cached_pload16(CPUI386 *cpu, uword addr)
+{
+	if (likely((addr & (IFETCH_CACHE_LINE_SIZE - 1)) <=
+		   IFETCH_CACHE_LINE_SIZE - 2)) {
+		u16 v = ifetch_cached_pload8(cpu, addr);
+		v |= (u16)ifetch_cached_pload8(cpu, addr + 1) << 8;
+		return v;
+	}
+	return pload16(cpu, addr);
+}
+
+static inline u32 ifetch_cached_pload32(CPUI386 *cpu, uword addr)
+{
+	if (likely((addr & (IFETCH_CACHE_LINE_SIZE - 1)) <=
+		   IFETCH_CACHE_LINE_SIZE - 4)) {
+		u32 v = ifetch_cached_pload8(cpu, addr);
+		v |= (u32)ifetch_cached_pload8(cpu, addr + 1) << 8;
+		v |= (u32)ifetch_cached_pload8(cpu, addr + 2) << 16;
+		v |= (u32)ifetch_cached_pload8(cpu, addr + 3) << 24;
+		return v;
+	}
+	return pload32(cpu, addr);
+}
+#else
+#define ifetch_cached_pload16(cpu, addr) pload16(cpu, addr)
+#define ifetch_cached_pload32(cpu, addr) pload32(cpu, addr)
 #endif
 
 /* lazy flags */
@@ -531,6 +620,7 @@ static void tlb_clear(CPUI386 *cpu)
 	}
 	cpu->ifetch.laddr = -1;
 	cpu->ifetch.paddr = 0;
+	ifetch_cache_init(cpu);
 }
 
 static int pte_lookup[2][4][2][2] = { //[wp != 0][(pte >> 1) & 3][cpl > 0][rwm > 1]
@@ -859,7 +949,7 @@ static bool IRAM_ATTR peek8(CPUI386 *cpu, u8 *val)
 {
 	uword laddr = cpu->seg[SEG_CS].base + cpu->next_ip;
 	if (likely((laddr ^ cpu->ifetch.laddr) < 4096)) {
-		*val = pload8(cpu, cpu->ifetch.xaddr ^ laddr);
+		*val = ifetch_cached_pload8(cpu, cpu->ifetch.xaddr ^ laddr);
 		return true;
 	}
 	OptAddr res;
@@ -873,7 +963,7 @@ static bool IRAM_ATTR peek8(CPUI386 *cpu, u8 *val)
 		*val = 0;
 		return true;
 	}
-	*val = pload8(cpu, paddr);
+	*val = ifetch_cached_pload8(cpu, paddr);
 	if (likely(paddr < cpu->phys_mem_size - 4096 && !in_iomem(paddr + 16))) {
 		cpu->ifetch.laddr = laddr & (~4095ul);
 		cpu->ifetch.xaddr = paddr ^ laddr;
@@ -884,7 +974,7 @@ static bool IRAM_ATTR peek8(CPUI386 *cpu, u8 *val)
 static bool IRAM_ATTR peek8a(CPUI386 *cpu, u8 *val)
 {
 	if (likely(cpu->ifetch.paddr)) {
-		*val = pload8(cpu, cpu->ifetch.paddr);
+		*val = ifetch_cached_pload8(cpu, cpu->ifetch.paddr);
 		return true;
 	}
 	TRY(peek8(cpu, val));
@@ -894,7 +984,7 @@ static bool IRAM_ATTR peek8a(CPUI386 *cpu, u8 *val)
 static bool IRAM_ATTR fetch8(CPUI386 *cpu, u8 *val)
 {
 	if (likely(cpu->ifetch.paddr)) {
-		*val = pload8(cpu, cpu->ifetch.paddr);
+		*val = ifetch_cached_pload8(cpu, cpu->ifetch.paddr);
 		cpu->ifetch.paddr++;
 		cpu->next_ip++;
 		return true;
@@ -909,7 +999,7 @@ static bool IRAM_ATTR fetch8pf(CPUI386 *cpu, u8 *val)
 	uword laddr = cpu->seg[SEG_CS].base + cpu->next_ip;
 	if (likely((laddr ^ cpu->ifetch.laddr) < 4096 - 16)) {
 		uword paddr = cpu->ifetch.xaddr ^ laddr;
-		*val = pload8(cpu, paddr);
+		*val = ifetch_cached_pload8(cpu, paddr);
 		cpu->ifetch.paddr = paddr + 1;
 		cpu->next_ip++;
 		return true;
@@ -923,14 +1013,14 @@ static bool IRAM_ATTR fetch8pf(CPUI386 *cpu, u8 *val)
 static bool IRAM_ATTR fetch16(CPUI386 *cpu, u16 *val)
 {
 	if (likely(cpu->ifetch.paddr)) {
-		*val = pload16(cpu, cpu->ifetch.paddr);
+		*val = ifetch_cached_pload16(cpu, cpu->ifetch.paddr);
 		cpu->ifetch.paddr += 2;
 		cpu->next_ip += 2;
 		return true;
 	}
 	uword laddr = cpu->seg[SEG_CS].base + cpu->next_ip;
 	if (likely((laddr ^ cpu->ifetch.laddr) < 4095)) {
-		*val = pload16(cpu, cpu->ifetch.xaddr ^ laddr);
+		*val = ifetch_cached_pload16(cpu, cpu->ifetch.xaddr ^ laddr);
 	} else {
 		OptAddr res;
 		TRY(translate16(cpu, &res, 1, SEG_CS, cpu->next_ip));
@@ -943,14 +1033,14 @@ static bool IRAM_ATTR fetch16(CPUI386 *cpu, u16 *val)
 static bool IRAM_ATTR fetch32(CPUI386 *cpu, u32 *val)
 {
 	if (likely(cpu->ifetch.paddr)) {
-		*val = pload32(cpu, cpu->ifetch.paddr);
+		*val = ifetch_cached_pload32(cpu, cpu->ifetch.paddr);
 		cpu->ifetch.paddr += 4;
 		cpu->next_ip += 4;
 		return true;
 	}
 	uword laddr = cpu->seg[SEG_CS].base + cpu->next_ip;
 	if (likely((laddr ^ cpu->ifetch.laddr) < 4093)) {
-		*val = pload32(cpu, cpu->ifetch.xaddr ^ laddr);
+		*val = ifetch_cached_pload32(cpu, cpu->ifetch.xaddr ^ laddr);
 	} else {
 		OptAddr res;
 		TRY(translate32(cpu, &res, 1, SEG_CS, cpu->next_ip));
@@ -4560,7 +4650,7 @@ static int __call_isr_check_cs(CPUI386 *cpu, int sel, int ext, int *csdpl)
 	}
 }
 
-static bool IRAM_ATTR call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
+static bool IRAM_ATTR_CPU_EXEC1 call_isr(CPUI386 *cpu, int no, bool pusherr, int ext)
 {
 	if (!(cpu->cr0 & 1)) {
 		/* REAL-ADDRESS-MODE */
@@ -5037,7 +5127,7 @@ static bool pmret(CPUI386 *cpu, bool opsz16, int off, bool isiret)
 	return true;
 }
 
-void cpui386_step(CPUI386 *cpu, int stepcount)
+void IRAM_ATTR_CPU_EXEC1 cpui386_step(CPUI386 *cpu, int stepcount)
 {
 	if ((cpu->flags & IF) && cpu->intr) {
 		cpu->intr = false;
@@ -5048,7 +5138,9 @@ void cpui386_step(CPUI386 *cpu, int stepcount)
 	}
 
 	if (cpu->halt) {
+#ifndef BUILD_ESP32
 		usleep(1);
+#endif
 		return;
 	}
 

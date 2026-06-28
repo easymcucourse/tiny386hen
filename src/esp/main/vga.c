@@ -142,6 +142,17 @@ struct VGAState {
     uint8_t last_cursor_start;
     uint8_t last_cursor_end;
 
+    /* graphics mode trace, printed only when mode-like parameters change */
+    int last_gfx_w;
+    int last_gfx_h;
+    int last_gfx_bpp;
+    int last_gfx_xdiv;
+    int last_gfx_shift_control;
+    int last_gfx_double_scan;
+    int last_gfx_multi_scan;
+    uint32_t last_gfx_line_offset;
+    uint32_t last_gfx_start_addr;
+
     /* VBE extension */
     uint16_t vbe_index;
     uint16_t vbe_regs[VBE_DISPI_INDEX_NB];
@@ -1027,6 +1038,68 @@ static void vga_text_refresh(VGAState *s,
     redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
 }
 
+static bool vga_graphic_refresh_mode13_dot(VGAState *s,
+                                           SimpleFBDrawFunc *redraw_func,
+                                           void *opaque,
+                                           uint32_t start_addr,
+                                           uint32_t line_offset,
+                                           uint32_t *palette,
+                                           int raw_w,
+                                           int raw_h,
+                                           int bpp,
+                                           int xdiv,
+                                           int shift_control,
+                                           int multi_scan)
+{
+    FBDevice *fb_dev = s->fb_dev;
+
+    if (vbe_enabled(s) || bpp != 8 || shift_control != 2 ||
+        xdiv != 2 || multi_scan != 1 || line_offset != 320 ||
+        raw_w != 640 || raw_h != 400 ||
+        fb_dev->width < 320 || fb_dev->height < 200) {
+        return false;
+    }
+
+    memset(fb_dev->fb_data, 0, fb_dev->width * fb_dev->height * (BPP / 8));
+
+    int x0 = (fb_dev->width - 320) / 2;
+    int y0 = (fb_dev->height - 200) / 2;
+    uint8_t *vram = s->vga_ram;
+    uint32_t base = 4 * start_addr;
+
+    for (int y = 0; y < 200; y++) {
+        uint32_t addr = base + y * line_offset;
+        for (int x = 0; x < 320; x++) {
+            uint32_t color = palette[vram[addr + x]];
+#if BPP == 32
+#ifdef SWAPXY
+            int i = (BPP / 8) * ((y0 + y) + (x0 + x) * fb_dev->height);
+#else
+            int i = (BPP / 8) * ((y0 + y) * fb_dev->width + x0 + x);
+#endif
+            fb_dev->fb_data[i + 0] = color;
+            fb_dev->fb_data[i + 1] = color >> 8;
+            fb_dev->fb_data[i + 2] = color >> 16;
+            fb_dev->fb_data[i + 3] = color >> 24;
+#elif BPP == 16
+#ifdef SWAPXY
+            int i = (BPP / 8) * ((y0 + y) + (x0 + x) * fb_dev->height);
+#else
+            int i = (BPP / 8) * ((y0 + y) * fb_dev->width + x0 + x);
+#endif
+            uint16_t out = (uint16_t)((color << 8) | (color >> 8));
+            fb_dev->fb_data[i + 0] = out;
+            fb_dev->fb_data[i + 1] = out >> 8;
+#else
+#error "bad bpp"
+#endif
+        }
+    }
+
+    redraw_func(opaque, 0, 0, fb_dev->width, fb_dev->height);
+    return true;
+}
+
 static void vga_graphic_refresh(VGAState *s,
                                 SimpleFBDrawFunc *redraw_func, void *opaque,
                                 int full_update)
@@ -1083,6 +1156,37 @@ static void vga_graphic_refresh(VGAState *s,
             if (bpp == 8)
                 update_palette256(s, palette);
         }
+    }
+
+    if (w != s->last_gfx_w ||
+        h != s->last_gfx_h ||
+        bpp != s->last_gfx_bpp ||
+        xdiv != s->last_gfx_xdiv ||
+        shift_control != s->last_gfx_shift_control ||
+        double_scan != s->last_gfx_double_scan ||
+        multi_scan != s->last_gfx_multi_scan ||
+        line_offset != s->last_gfx_line_offset ||
+        start_addr != s->last_gfx_start_addr) {
+        fprintf(stderr,
+                "[vga] gfx raw=%dx%d bpp=%d xdiv=%d shift=%d double=%d multi=%d line=%lu start=%lu vbe=%d fb=%dx%d\n",
+                w, h, bpp, xdiv, shift_control, double_scan, multi_scan,
+                (unsigned long)line_offset, (unsigned long)start_addr,
+                vbe_enabled(s) ? 1 : 0, fb_dev->width, fb_dev->height);
+        s->last_gfx_w = w;
+        s->last_gfx_h = h;
+        s->last_gfx_bpp = bpp;
+        s->last_gfx_xdiv = xdiv;
+        s->last_gfx_shift_control = shift_control;
+        s->last_gfx_double_scan = double_scan;
+        s->last_gfx_multi_scan = multi_scan;
+        s->last_gfx_line_offset = line_offset;
+        s->last_gfx_start_addr = start_addr;
+    }
+
+    if (vga_graphic_refresh_mode13_dot(s, redraw_func, opaque, start_addr,
+                                       line_offset, palette, w, h, bpp, xdiv,
+                                       shift_control, multi_scan)) {
+        return;
     }
 
     int y1 = 0;

@@ -22,6 +22,13 @@
 #include "common.h"
 #include "startup_splash.h"
 
+#ifndef PC_PERF_LOG_INTERVAL_US
+#define PC_PERF_LOG_INTERVAL_US 1000000u
+#endif
+#ifndef PC_PERF_LOG_ENABLED
+#define PC_PERF_LOG_ENABLED 1
+#endif
+
 //
 #include "esp_private/system_internal.h"
 /* ne2000 network disabled: provide null send hook so ne2000.c links */
@@ -324,8 +331,34 @@ static int pc_main(const char *file)
 	pc->boot_start_time = get_uticks();
 	uint32_t step_count = 0;
 	bool boot_sector_signaled = false;
+	uint32_t idle_step_interval = 1048576u / PC_STEP_COUNT;
+	if (idle_step_interval == 0)
+		idle_step_interval = 1;
+	uint32_t next_idle_step = idle_step_interval;
+#if PC_PERF_LOG_ENABLED
+	uint32_t perf_last_us = get_uticks();
+	uint32_t perf_last_steps = 0;
+	long perf_last_cycles = cpui386_get_cycle(pc->cpu);
+#endif
 	for (; pc->shutdown_state != 8;) {
 		pc_step(pc);
+#if PC_PERF_LOG_ENABLED
+		uint32_t perf_now_us = get_uticks();
+		if ((uint32_t)(perf_now_us - perf_last_us) >= PC_PERF_LOG_INTERVAL_US) {
+			long perf_cycles = cpui386_get_cycle(pc->cpu);
+			uint32_t elapsed_us = perf_now_us - perf_last_us;
+			uint32_t iter_delta = step_count - perf_last_steps;
+			long cycle_delta = perf_cycles - perf_last_cycles;
+			long ips = elapsed_us ?
+				(long)((int64_t)cycle_delta * 1000000 / elapsed_us) : 0;
+			fprintf(stderr,
+				"[perf] ips=%ld cycles=%ld pc_steps=%lu step_count=%d\n",
+				ips, cycle_delta, (unsigned long)iter_delta, PC_STEP_COUNT);
+			perf_last_us = perf_now_us;
+			perf_last_steps = step_count;
+			perf_last_cycles = perf_cycles;
+		}
+#endif
 		if (!boot_sector_signaled && pc->boot_sector_seen) {
 			boot_sector_signaled = true;
 			fprintf(stderr, "[splash] switching display after Booting from 0000:7c00\n");
@@ -335,8 +368,11 @@ static int pc_main(const char *file)
 		 * Let lower-priority idle task run periodically so Task WDT
 		 * does not trigger while the emulator monopolizes CPU1.
 		 */
-		if ((++step_count & 0x7FFu) == 0)
+		step_count++;
+		if (step_count == next_idle_step) {
 			vTaskDelay(1);
+			next_idle_step += idle_step_interval;
+		}
 	}
 	return 0;
 }

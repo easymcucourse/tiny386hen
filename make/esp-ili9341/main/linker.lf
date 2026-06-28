@@ -10,6 +10,7 @@ entries:
 archive: libmain.a
 entries:
     i386 (tiny386_cpu_iram)
+    pc (tiny386_cpu_iram)
 
 [mapping:tiny386hen_external_bss_libc]
 archive: libc.a

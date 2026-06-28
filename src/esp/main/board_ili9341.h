@@ -31,6 +31,18 @@
 #define I2S_DOUT 41
 #define MIXER_BUF_LEN 512
 
+/* Run more x86 instructions per device poll to reduce interpreter overhead. */
+#define PC_STEP_COUNT 16384
+#define PC_PERF_LOG_ENABLED 0
+#define PC_PERF_LOG_INTERVAL_US 5000000u
+#define PC_CMOS_STEP_DIV 16
+#define PC_KBD_STEP_DIV 2
+#define PC_DMA_STEP_DIV 2
+#define PC_SERIAL_STEP_DIV 2
+
+/* Network is disabled on this board; omit NE2000 state and runtime work. */
+#define TINY386_NO_NE2000 1
+
 
 
 /* This panel/wiring has been verified with the reference firmware at 80MHz.
@@ -40,7 +52,13 @@
 #define LCD_ILI9341_H_RES  240
 #define LCD_ILI9341_V_RES  320
 
-/* SD card disabled: GPIO18/19 conflict with USB OTG D+/D- */
+/* SD card (SDSPI) */
+#define SD_SPI_HOST      SPI3_HOST
+#define SD_SPI_CS        9
+#define SD_SPI_MOSI      10
+#define SD_SPI_MISO      11
+#define SD_SPI_SCK       12
+#define SD_SPI_FREQ_KHZ  10000
 
 /*
  * Allocate the psmalloc arena from the SPIRAM heap rather than using the raw
