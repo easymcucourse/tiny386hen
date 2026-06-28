@@ -529,6 +529,7 @@ typedef struct {
     ShiftOp    sh_op;
     CondCode   cc;
     uint32_t   target_eip; /* for JMP/JCC: resolved target EIP */
+    bool       flags_dead;
 } X86Action;
 
 /*
@@ -801,7 +802,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
     int dr = X86REG_TO_LX7(a->dst);
     int sr = X86REG_TO_LX7(a->src);
-    int t0 = LX7_TMP0, t1 = LX7_TMP1;
+    int t0 = LX7_TMP0, t1 = LX7_TMP1, t2 = LX7_TMP2;
 
     switch (a->type) {
 
@@ -865,27 +866,69 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         GUARD(16); emit_movi32(p, dr, (uint32_t)a->imm); break;
 
     /* ---- ALU ------------------------------------------------ */
-    case ACT_ALU_RR:
-        GUARD(3);
+    case ACT_ALU_RR: {
+        bool fd = a->flags_dead;
+        int cc_op = 0;
+        int cc_mask = 0;
         switch (a->alu_op) {
-        case ALU_ADD: emit_add(p, dr, dr, sr); break;
-        case ALU_SUB: emit_sub(p, dr, dr, sr); break;
-        case ALU_AND: emit_and(p, dr, dr, sr); break;
-        case ALU_OR:  emit_or (p, dr, dr, sr); break;
-        case ALU_XOR: emit_xor(p, dr, dr, sr); break;
+        case ALU_ADD: cc_op = JIT_CC_ADD; cc_mask = JIT_CC_MASK_ARITH; break;
+        case ALU_SUB: cc_op = JIT_CC_SUB; cc_mask = JIT_CC_MASK_ARITH; break;
+        case ALU_AND: cc_op = JIT_CC_AND; cc_mask = JIT_CC_MASK_LOGIC; break;
+        case ALU_OR:  cc_op = JIT_CC_OR;  cc_mask = JIT_CC_MASK_LOGIC; break;
+        case ALU_XOR: cc_op = JIT_CC_XOR; cc_mask = JIT_CC_MASK_LOGIC; break;
         default: return false;
         }
+
+        if (!fd) {
+            GUARD(24);
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
+            emit_s32i(p, sr, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
+            switch (a->alu_op) {
+            case ALU_ADD: emit_add(p, dr, dr, sr); break;
+            case ALU_SUB: emit_sub(p, dr, dr, sr); break;
+            case ALU_AND: emit_and(p, dr, dr, sr); break;
+            case ALU_OR:  emit_or (p, dr, dr, sr); break;
+            case ALU_XOR: emit_xor(p, dr, dr, sr); break;
+            default: return false;
+            }
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t0, cc_op);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi(p, t0, cc_mask);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        } else {
+            GUARD(3);
+            switch (a->alu_op) {
+            case ALU_ADD: emit_add(p, dr, dr, sr); break;
+            case ALU_SUB: emit_sub(p, dr, dr, sr); break;
+            case ALU_AND: emit_and(p, dr, dr, sr); break;
+            case ALU_OR:  emit_or (p, dr, dr, sr); break;
+            case ALU_XOR: emit_xor(p, dr, dr, sr); break;
+            default: return false;
+            }
+        }
         break;
+    }
 
     case ACT_ALU_RI: {
         int32_t imm = a->imm;
-        if (a->alu_op == ALU_ADD && imm >= -128 && imm <= 127) {
-            GUARD(3); emit_addi(p, dr, dr, imm);
-        } else if (a->alu_op == ALU_SUB && imm >= -127 && imm <= 128) {
-            GUARD(3); emit_addi(p, dr, dr, -imm);
-        } else {
-            GUARD(16 + 3);
+        bool fd = a->flags_dead;
+        int cc_op = 0;
+        int cc_mask = 0;
+        switch (a->alu_op) {
+        case ALU_ADD: cc_op = JIT_CC_ADD; cc_mask = JIT_CC_MASK_ARITH; break;
+        case ALU_SUB: cc_op = JIT_CC_SUB; cc_mask = JIT_CC_MASK_ARITH; break;
+        case ALU_AND: cc_op = JIT_CC_AND; cc_mask = JIT_CC_MASK_LOGIC; break;
+        case ALU_OR:  cc_op = JIT_CC_OR;  cc_mask = JIT_CC_MASK_LOGIC; break;
+        case ALU_XOR: cc_op = JIT_CC_XOR; cc_mask = JIT_CC_MASK_LOGIC; break;
+        default: return false;
+        }
+
+        if (!fd) {
+            GUARD(56);
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
             emit_movi32(p, t0, (uint32_t)imm);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
             switch (a->alu_op) {
             case ALU_ADD: emit_add(p, dr, dr, t0); break;
             case ALU_SUB: emit_sub(p, dr, dr, t0); break;
@@ -893,6 +936,28 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
             case ALU_OR:  emit_or (p, dr, dr, t0); break;
             case ALU_XOR: emit_xor(p, dr, dr, t0); break;
             default: return false;
+            }
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t0, cc_op);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi(p, t0, cc_mask);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        } else {
+            if (a->alu_op == ALU_ADD && imm >= -128 && imm <= 127) {
+                GUARD(3); emit_addi(p, dr, dr, imm);
+            } else if (a->alu_op == ALU_SUB && imm >= -127 && imm <= 128) {
+                GUARD(3); emit_addi(p, dr, dr, -imm);
+            } else {
+                GUARD(16 + 3);
+                emit_movi32(p, t0, (uint32_t)imm);
+                switch (a->alu_op) {
+                case ALU_ADD: emit_add(p, dr, dr, t0); break;
+                case ALU_SUB: emit_sub(p, dr, dr, t0); break;
+                case ALU_AND: emit_and(p, dr, dr, t0); break;
+                case ALU_OR:  emit_or (p, dr, dr, t0); break;
+                case ALU_XOR: emit_xor(p, dr, dr, t0); break;
+                default: return false;
+                }
             }
         }
         break;
@@ -906,8 +971,22 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         emit_xor(p, dr, dr, t0);
         break;
 
-    case ACT_NEG_R:
-        GUARD(3); emit_neg(p, dr, dr); break;
+    case ACT_NEG_R: {
+        bool fd = a->flags_dead;
+        if (!fd) {
+            GUARD(24);
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
+            emit_neg(p, dr, dr);
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t0, JIT_CC_NEG32);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi(p, t0, JIT_CC_MASK_ARITH);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        } else {
+            GUARD(3); emit_neg(p, dr, dr);
+        }
+        break;
+    }
 
     case ACT_INC_R:
         /*
@@ -951,30 +1030,66 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     }
 
     /* ---- CMP / TEST ---------------------------------------- */
-    case ACT_CMP_RR:
+    case ACT_CMP_RR: {
         cs->cmp_mode  = 1;
         cs->cmp_lreg  = dr;  /* note: dr = a->dst, the left operand */
         cs->cmp_rreg  = sr;
-        break;
 
-    case ACT_CMP_RI:
-        /* Compute (dr - imm) into TMP2 for the subsequent branch */
-        GUARD(16 + 3);
+        bool fd = a->flags_dead;
+        if (!fd) {
+            GUARD(24);
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
+            emit_s32i(p, sr, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
+            emit_sub(p, t0, dr, sr);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t2, JIT_CC_SUB);
+            emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi(p, t2, JIT_CC_MASK_ARITH);
+            emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        }
+        break;
+    }
+
+    case ACT_CMP_RI: {
+        /* Compute (dr - imm) into TMP0 for the subsequent branch and cc.dst */
+        bool fd = a->flags_dead;
+        GUARD(16 + 3 + (fd ? 0 : 24));
         emit_movi32(p, t1, (uint32_t)a->imm);
         emit_sub(p, t0, dr, t1);
         cs->cmp_mode  = 2;
         cs->cmp_lreg  = dr;
         cs->cmp_rreg  = t1;  /* original imm in t1 */
         cs->cmp_tmp   = t0;  /* (dr - imm) in t0 */
-        break;
 
-    case ACT_TEST_RR:
+        if (!fd) {
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
+            emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t2, JIT_CC_SUB);
+            emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi(p, t2, JIT_CC_MASK_ARITH);
+            emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        }
+        break;
+    }
+
+    case ACT_TEST_RR: {
         /* Compute (dr & sr) into TMP0 for BEQZ/BNEZ */
-        GUARD(3);
+        bool fd = a->flags_dead;
+        GUARD(3 + (fd ? 0 : 15));
         emit_and(p, t0, dr, sr);
         cs->cmp_mode  = 3;
         cs->cmp_lreg  = t0;
+
+        if (!fd) {
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t1, JIT_CC_AND);
+            emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi(p, t1, JIT_CC_MASK_LOGIC);
+            emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        }
         break;
+    }
 
     /* ---- Unconditional jump --------------------------------- */
     case ACT_JMP:
@@ -1024,9 +1139,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         int lx7r = cs->cmp_rreg;
 
         if (cs->cmp_mode == 0) {
-            /* No pending CMP; treat as JMP (unconditional) for safety */
-            emit_j_target(&bp, taken_start);
-            break;
+            return false;
         }
 
         /* Fuse CMP + Jcc into a single LX7 branch */
@@ -1047,15 +1160,35 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         /* Signed comparisons */
         case CC_L:   emit_blt (&bp, lx7l, lx7r, (int8_t)br_off); break;
         case CC_NL:  emit_bge (&bp, lx7l, lx7r, (int8_t)br_off); break;
+        case CC_LE:
+            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_bge(&bp, lx7r, lx7l, (int8_t)br_off);
+            else                                        return false;
+            break;
+        case CC_NLE:
+            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_blt(&bp, lx7r, lx7l, (int8_t)br_off);
+            else                                        return false;
+            break;
         /* Unsigned comparisons */
         case CC_B:   emit_bltu(&bp, lx7l, lx7r, (int8_t)br_off); break;
         case CC_NB:  emit_bgeu(&bp, lx7l, lx7r, (int8_t)br_off); break;
+        case CC_BE:
+            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_bgeu(&bp, lx7r, lx7l, (int8_t)br_off);
+            else                                        return false;
+            break;
+        case CC_NBE:
+            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_bltu(&bp, lx7r, lx7l, (int8_t)br_off);
+            else                                        return false;
+            break;
         /* Sign-flag test (SF): result < 0 ↔ top bit set */
-        case CC_S:   emit_bltz(&bp, zreg, br_off & 0xFFF); break;
-        case CC_NS:  emit_bgez(&bp, zreg, br_off & 0xFFF); break;
-        /* LE / NBE and overflow (CC_O/CC_NO/CC_BE/CC_NBE) need multi-
-         * step flag arithmetic; emit a plain J as conservative fallback */
-        default: emit_j_target(&bp, taken_start); break;
+        case CC_S:
+            if (cs->cmp_mode == 2 || cs->cmp_mode == 3) emit_bltz(&bp, zreg, br_off & 0xFFF);
+            else                                        return false;
+            break;
+        case CC_NS:
+            if (cs->cmp_mode == 2 || cs->cmp_mode == 3) emit_bgez(&bp, zreg, br_off & 0xFFF);
+            else                                        return false;
+            break;
+        default: return false;
         }
         cs->cmp_mode = 0;
         break;
@@ -1134,32 +1267,31 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CDQ)
         return true;
-    /*
-     * Keep ACT_XCHG_EAX_R disabled for now.
-     *
-     * The instruction is semantically simple and passed the 30-second boot
-     * smoke test, but the boot benchmark consistently showed it making the
-     * interval from "set VGA mode 1" to "BENCH_START CO80" slower:
-     *
-     *   baseline:        22369 ms -> 43237 ms = 20868 ms
-     *   +CDQ:            22368 ms -> 43232 ms = 20864 ms
-     *   +CDQ+XCHG:       22377 ms -> 43251 ms = 20874 ms
-     *   +XCHG only:      22371 ms -> 43251 ms = 20880 ms
-     *
-     * That points at XCHG itself rather than CDQ/BSWAP interaction.  Leave
-     * the decoder/emitter in place so it can be re-tested later, but do not
-     * enable it in the normal level-2 JIT set until the slowdown is explained.
-     */
-    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_XCHG_EAX_R)
-        return true; */
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_BSWAP_R)
         return true;
     /*
-     * Keep DEC disabled until the emitter preserves x86 lazy flags correctly.
-     * DEC-only firmware tests WDT around SeaBIOS relocation.
+     * Keep the expanded level-2 instruction set disabled for now.  Enabling
+     * MOV_RI/ALU/CMP/TEST/NEG/Jcc still WDTs during SeaBIOS relocation on
+     * ESP32-S3.  The likely issue is a remaining interpreter/JIT state
+     * mismatch around lazy flags or block-boundary control flow, so fall back
+     * to the known-safe level-2 whitelist above.
      */
-    if (TINY386_JIT_LEVEL >= 3 && a->type == ACT_MOV_RR)
-        return true;
+    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_MOV_RI)
+        return true; */
+    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_ALU_RR)
+        return true; */
+    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_ALU_RI)
+        return true; */
+    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NEG_R)
+        return true; */
+    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CMP_RR)
+        return true; */
+    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CMP_RI)
+        return true; */
+    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_TEST_RR)
+        return true; */
+    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_JCC)
+        return true; */
     return false;
 }
 
@@ -1268,50 +1400,90 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     /* Emit prologue: load x86 GPRs into LX7 registers */
     emit_prologue(&p, LX7_CPU_REG);
 
-    /* Scan and translate x86 instructions */
-    CmpState cs   = {0};
-    int      x86_consumed = 0;
-    bool     ok   = true;
-    uint32_t cur_eip = eip;
+    /* Pass 1: Scan and decode all instructions in the block */
+    X86Action actions[JIT_SCAN_LIMIT];
+    uint8_t   action_bytes[JIT_SCAN_LIMIT];
+    int       insn_count = 0;
+    int       x86_consumed = 0;
+    uint32_t  cur_eip = eip;
 
     for (int n = 0; n < JIT_SCAN_LIMIT; n++) {
-        X86Action a;
-        int bytes = decode_x86_insn(x86 + x86_consumed, cur_eip, &a);
-        if (bytes != 0 && !jit_action_enabled(&a, n))
+        X86Action *a = &actions[n];
+        int bytes = decode_x86_insn(x86 + x86_consumed, cur_eip, a);
+        if (bytes != 0 && !jit_action_enabled(a, n))
             bytes = 0;
         if (bytes == 0) {
-            /* Unhandled: emit epilogue up to here and stop */
-            if (n == 0) {
-                /* Not a single instruction handled: mark NOJIT */
-                block->guest_paddr = paddr;
-                block->status      = JIT_NOJIT;
-                jit->bailed++;
-                return NULL;
-            }
-            /* Emit epilogue falling through to interpreter */
-            emit_epilogue(&p, LX7_CPU_REG, cur_eip);
-            x86_consumed += 0; /* don't consume the unhandled byte */
             break;
         }
-
-        ok = emit_action(&p, code_end, &a, &cs, cur_eip + bytes, LX7_CPU_REG);
-        if (!ok) break;
-
+        action_bytes[n] = bytes;
         x86_consumed += bytes;
         cur_eip      += bytes;
+        insn_count++;
+
+        if (a->type == ACT_JMP || a->type == ACT_JCC || a->type == ACT_BLOCK_END)
+            break;
+    }
+
+    if (insn_count == 0) {
+        block->guest_paddr = paddr;
+        block->status      = JIT_NOJIT;
+        jit->bailed++;
+        return NULL;
+    }
+
+    /* Backward pass: Dead flag elimination */
+    bool flags_live = true;
+    for (int i = insn_count - 1; i >= 0; i--) {
+        X86Action *a = &actions[i];
+        bool reads_flags = (a->type == ACT_JCC);
+        bool writes_flags = false;
+
+        if (a->type == ACT_ALU_RR || a->type == ACT_ALU_RI ||
+            a->type == ACT_CMP_RR || a->type == ACT_CMP_RI ||
+            a->type == ACT_TEST_RR || a->type == ACT_NEG_R ||
+            a->type == ACT_INC_R || a->type == ACT_DEC_R ||
+            a->type == ACT_SHx_RI || a->type == ACT_SHx_CL) {
+            writes_flags = true;
+        }
+
+        if (reads_flags) {
+            flags_live = true;
+        }
+
+        if (writes_flags) {
+            if (!flags_live) {
+                a->flags_dead = true;
+            } else {
+                a->flags_dead = false;
+                flags_live = false; // overwritten, so dead for prior instructions
+            }
+        }
+    }
+
+    /* Pass 2: Translate and emit Xtensa instructions */
+    CmpState cs   = {0};
+    int      emitted_bytes = 0;
+    bool     ok   = true;
+    cur_eip = eip;
+
+    for (int n = 0; n < insn_count; n++) {
+        X86Action *a = &actions[n];
+        int bytes = action_bytes[n];
+
+        ok = emit_action(&p, code_end, a, &cs, cur_eip + bytes, LX7_CPU_REG);
+        if (!ok) break;
+
+        emitted_bytes += bytes;
+        cur_eip       += bytes;
 
 #if TINY386_JIT_SINGLE_INSN_BLOCK
         emit_epilogue(&p, LX7_CPU_REG, cur_eip);
         break;
 #endif
-
-        /* Block-terminating instructions end the translation */
-        if (a.type == ACT_JMP || a.type == ACT_JCC || a.type == ACT_BLOCK_END)
-            break;
     }
 
     if (!ok || p >= code_end) {
-        if (x86_consumed == 0) {
+        if (emitted_bytes == 0) {
             block->guest_paddr = paddr;
             block->status      = JIT_NOJIT;
             jit->bailed++;
@@ -1333,7 +1505,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     block->guest_cs_base= cs_base;
     block->host_code    = pool_start;
     block->host_len     = (uint16_t)(p - code_start);
-    block->x86_len      = (uint16_t)x86_consumed;
+    block->x86_len      = (uint16_t)emitted_bytes;
     block->status       = JIT_VALID;
 
 #ifdef BUILD_ESP32
@@ -1344,17 +1516,17 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     return block;
 }
 
-bool jit_try_execute(JITState *jit, CPUI386 *cpu)
+int jit_try_execute(JITState *jit, CPUI386 *cpu)
 {
     if (!jit->pool || cpui386_is_code16(cpu))
-        return false;
+        return 0;
 
     uint32_t cs_base = cpui386_get_cs_base(cpu);
     uint32_t laddr   = cs_base + cpui386_get_next_ip(cpu);
     uint32_t cr0 = cpui386_get_cr0(cpu);
     if (cr0 & 0x80000000u) {
         if (laddr >= (uint32_t)cpui386_get_phys_mem_size(cpu))
-            return false;
+            return 0;
     }
     uint32_t paddr = laddr;
 
@@ -1363,7 +1535,7 @@ bool jit_try_execute(JITState *jit, CPUI386 *cpu)
 
     if (block->status == JIT_NOJIT && block->guest_paddr == paddr) {
         jit->misses++;
-        return false;
+        return 0;
     }
 
     if (block->status != JIT_VALID || block->guest_paddr != paddr) {
@@ -1371,7 +1543,7 @@ bool jit_try_execute(JITState *jit, CPUI386 *cpu)
         block = jit_translate(jit, cpu);
         if (!block) {
             jit->misses++;
-            return false;
+            return 0;
         }
     }
 
@@ -1389,9 +1561,9 @@ bool jit_try_execute(JITState *jit, CPUI386 *cpu)
     typedef void (*JITFunc)(CPUI386 *);
     JITFunc fn = (JITFunc)(void *)block->host_code;
     fn(cpu);
-    return true;
+    return block->x86_len;
 #else
     (void)block;
-    return false;
+    return 0;
 #endif
 }

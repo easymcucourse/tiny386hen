@@ -35,16 +35,36 @@
 /* ------------------------------------------------------------------ */
 
 /* Number of cached basic blocks (power-of-2 for fast modulo) */
-#define JIT_CACHE_ENTRIES   128
+#define JIT_CACHE_ENTRIES   512
 
 /* Max LX7 bytes emitted per basic block                              */
-#define JIT_BLOCK_MAXBYTES  512
+#define JIT_BLOCK_MAXBYTES  256
 
 /* Max x86 instructions scanned in one basic block before giving up   */
 #define JIT_SCAN_LIMIT      64
 
 /* Total IRAM code pool (bytes).  Must be <= available IRAM headroom. */
-#define JIT_POOL_SIZE       (JIT_CACHE_ENTRIES * JIT_BLOCK_MAXBYTES)
+#define JIT_POOL_SIZE       65536
+
+/* CPUI386 cc struct offsets in bytes (verified via static assert in i386.c) */
+#define JIT_CC_OP_OFF       844
+#define JIT_CC_DST_OFF      848
+#define JIT_CC_DST2_OFF     852
+#define JIT_CC_SRC1_OFF     856
+#define JIT_CC_SRC2_OFF     860
+#define JIT_CC_MASK_OFF     864
+
+/* CPUI386 cc.op values (verified via static assert in i386.c) */
+#define JIT_CC_ADD          1
+#define JIT_CC_SUB          3
+#define JIT_CC_NEG32        6
+#define JIT_CC_AND          26
+#define JIT_CC_OR           27
+#define JIT_CC_XOR          28
+
+/* CPUI386 cc.mask values (arithmetic vs logical) */
+#define JIT_CC_MASK_ARITH   0x8D5
+#define JIT_CC_MASK_LOGIC   0x8C5
 
 /* ------------------------------------------------------------------ */
 /* x86 → LX7 register mapping                                         */
@@ -115,7 +135,7 @@ void jit_init(JITState *jit, uint8_t *iram_pool);
  *
  * On a true return cpu->next_ip has already been advanced past the block.
  */
-bool jit_try_execute(JITState *jit, CPUI386 *cpu);
+int jit_try_execute(JITState *jit, CPUI386 *cpu);
 
 /**
  * jit_translate() — translate the basic block at cpu's current PC.

@@ -608,7 +608,7 @@ static inline int get_IOPL(CPUI386 *cpu)
 #define CR0_PG (1<<31)
 #define CR0_WP (0x10000)
 #ifdef BUILD_ESP32
-#define tlb_size 1024
+#define tlb_size 256
 #else
 #define tlb_size 512
 #endif
@@ -5153,10 +5153,28 @@ void IRAM_ATTR_CPU_EXEC1 cpui386_step(CPUI386 *cpu, int stepcount)
 	}
 
 #if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
-	if (jit_try_execute(&cpu->jit, cpu)) {
-		cpu->cycle++;
-		cpu->ifetch.paddr = 0;
-		return;
+	int steps = 0;
+	while (steps < stepcount) {
+		if ((cpu->flags & IF) && cpu->intr) {
+			return;
+		}
+		if (cpu->halt) {
+			return;
+		}
+		int consumed = jit_try_execute(&cpu->jit, cpu);
+		if (consumed > 0) {
+			steps += consumed;
+			cpu->cycle += consumed;
+			cpu->ifetch.paddr = 0;
+		} else {
+			break;
+		}
+	}
+	if (steps > 0) {
+		stepcount -= steps;
+		if (stepcount <= 0) {
+			return;
+		}
 	}
 #endif
 
@@ -5447,3 +5465,22 @@ static void cpu_debug(CPUI386 *cpu)
 	cpu->excerr = excerr;
 	nest--;
 }
+
+#if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
+#include "jit_lx7.h"
+#include <stddef.h>
+_Static_assert(offsetof(struct CPUI386, cc.op)   == JIT_CC_OP_OFF,   "JIT_CC_OP_OFF mismatch");
+_Static_assert(offsetof(struct CPUI386, cc.dst)  == JIT_CC_DST_OFF,  "JIT_CC_DST_OFF mismatch");
+_Static_assert(offsetof(struct CPUI386, cc.dst2) == JIT_CC_DST2_OFF, "JIT_CC_DST2_OFF mismatch");
+_Static_assert(offsetof(struct CPUI386, cc.src1) == JIT_CC_SRC1_OFF, "JIT_CC_SRC1_OFF mismatch");
+_Static_assert(offsetof(struct CPUI386, cc.src2) == JIT_CC_SRC2_OFF, "JIT_CC_SRC2_OFF mismatch");
+_Static_assert(offsetof(struct CPUI386, cc.mask) == JIT_CC_MASK_OFF, "JIT_CC_MASK_OFF mismatch");
+_Static_assert(CC_ADD == JIT_CC_ADD, "CC_ADD mismatch");
+_Static_assert(CC_SUB == JIT_CC_SUB, "CC_SUB mismatch");
+_Static_assert(CC_NEG32 == JIT_CC_NEG32, "CC_NEG32 mismatch");
+_Static_assert(CC_AND == JIT_CC_AND, "CC_AND mismatch");
+_Static_assert(CC_OR == JIT_CC_OR, "CC_OR mismatch");
+_Static_assert(CC_XOR == JIT_CC_XOR, "CC_XOR mismatch");
+_Static_assert((CF | PF | AF | ZF | SF | OF) == JIT_CC_MASK_ARITH, "JIT_CC_MASK_ARITH mismatch");
+_Static_assert((CF | PF | ZF | SF | OF) == JIT_CC_MASK_LOGIC, "JIT_CC_MASK_LOGIC mismatch");
+#endif

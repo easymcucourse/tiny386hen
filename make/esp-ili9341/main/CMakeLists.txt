@@ -70,6 +70,10 @@ add_definitions(-DI386_ENABLE_FPU)
 target_link_options(${COMPONENT_LIB} INTERFACE
     -Wl,--wrap=sdmmc_init_spi_crc
     -Wl,--undefined=__wrap_sdmmc_init_spi_crc
+    -Wl,--wrap=sdmmc_read_sectors
+    -Wl,--undefined=__wrap_sdmmc_read_sectors
+    -Wl,--wrap=sdmmc_write_sectors
+    -Wl,--undefined=__wrap_sdmmc_write_sectors
     -Wl,--wrap=fopen
     -Wl,--wrap=fread
     -Wl,--wrap=fwrite
