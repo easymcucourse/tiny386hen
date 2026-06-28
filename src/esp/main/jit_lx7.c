@@ -1221,6 +1221,52 @@ static inline uint32_t jit_align4(uint32_t v)
     return (v + 3u) & ~3u;
 }
 
+static void jit_mark_nojit(JITBlock *block, uint32_t paddr, uint32_t guest_end,
+                           JITBailReason bail)
+{
+    block->guest_paddr = paddr;
+    block->guest_end   = guest_end;
+    block->flags       = JIT_BLOCKF_STICKY_NOJIT;
+    block->exit_kind   = JIT_EXIT_INTERPRETER;
+#if TINY386_JIT_BAIL_REASONS
+    block->bail        = bail;
+#else
+    (void)bail;
+    block->bail        = JIT_BAIL_NONE;
+#endif
+    block->status      = JIT_NOJIT;
+}
+
+static uint16_t jit_block_flags_for_actions(const X86Action *actions, int count)
+{
+    if (count <= 0)
+        return JIT_BLOCKF_NONE;
+
+    switch (actions[count - 1].type) {
+    case ACT_JMP:
+        return JIT_BLOCKF_ENDS_JMP;
+    case ACT_JCC:
+        return JIT_BLOCKF_ENDS_JCC;
+    default:
+        return JIT_BLOCKF_NONE;
+    }
+}
+
+static JITExitKind jit_exit_kind_for_actions(const X86Action *actions, int count)
+{
+    if (count <= 0)
+        return JIT_EXIT_UNKNOWN;
+
+    switch (actions[count - 1].type) {
+    case ACT_JMP:
+        return JIT_EXIT_DIRECT_JMP;
+    case ACT_JCC:
+        return JIT_EXIT_COND_TAKEN;
+    default:
+        return JIT_EXIT_FALLTHROUGH;
+    }
+}
+
 static bool jit_action_enabled(const X86Action *a, int block_insn_index)
 {
     /*
@@ -1328,17 +1374,31 @@ void jit_init(JITState *jit, uint8_t *iram_pool)
 
 void jit_invalidate_all(JITState *jit)
 {
-    for (int i = 0; i < JIT_CACHE_ENTRIES; i++)
+    for (int i = 0; i < JIT_CACHE_ENTRIES; i++) {
+        if (jit->blocks[i].status == JIT_VALID)
+            jit->invalidations++;
         jit->blocks[i].status = JIT_EMPTY;
+    }
     jit->pool_used = 0;
+    jit->pool_epoch++;
 }
 
 void jit_invalidate_page(JITState *jit, uint32_t paddr)
 {
-    uint32_t page = paddr & ~0xFFFu;
+    uint32_t page_start = paddr & JIT_GUEST_PAGE_MASK;
+    uint32_t page_end   = page_start + JIT_GUEST_PAGE_SIZE;
+
+    jit->smc_flushes++;
+
     for (int i = 0; i < JIT_CACHE_ENTRIES; i++) {
-        if ((jit->blocks[i].guest_paddr & ~0xFFFu) == page)
-            jit->blocks[i].status = JIT_EMPTY;
+        JITBlock *block = &jit->blocks[i];
+        if (block->status != JIT_VALID)
+            continue;
+
+        if (block->guest_paddr < page_end && block->guest_end > page_start) {
+            block->status = JIT_EMPTY;
+            jit->invalidations++;
+        }
     }
 }
 
@@ -1368,10 +1428,6 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     }
 
     uint32_t paddr = laddr;
-    if (paddr + JIT_SCAN_LIMIT * 16 > phys_mem_size)
-        return NULL;
-
-    const uint8_t *x86 = (const uint8_t *)cpui386_get_phys_mem(cpu) + paddr;
 
     /* Allocate or find cache slot */
     uint32_t  slot  = jit_hash(paddr);
@@ -1379,6 +1435,14 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
     if (block->status == JIT_NOJIT && block->guest_paddr == paddr)
         return NULL; /* previously deemed un-translatable */
+
+    if (paddr + JIT_SCAN_LIMIT * 16 > phys_mem_size) {
+        jit_mark_nojit(block, paddr, paddr, JIT_BAIL_OUT_OF_GUEST_MEM);
+        jit->bailed++;
+        return NULL;
+    }
+
+    const uint8_t *x86 = (const uint8_t *)cpui386_get_phys_mem(cpu) + paddr;
 
     /* Evict the old entry if occupied by a different address */
     if (block->status == JIT_VALID && block->guest_paddr != paddr)
@@ -1406,12 +1470,15 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     int       insn_count = 0;
     int       x86_consumed = 0;
     uint32_t  cur_eip = eip;
+    JITBailReason scan_bail = JIT_BAIL_UNSUPPORTED_OPCODE;
 
     for (int n = 0; n < JIT_SCAN_LIMIT; n++) {
         X86Action *a = &actions[n];
         int bytes = decode_x86_insn(x86 + x86_consumed, cur_eip, a);
-        if (bytes != 0 && !jit_action_enabled(a, n))
+        if (bytes != 0 && !jit_action_enabled(a, n)) {
+            scan_bail = JIT_BAIL_DISABLED;
             bytes = 0;
+        }
         if (bytes == 0) {
             break;
         }
@@ -1425,8 +1492,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     }
 
     if (insn_count == 0) {
-        block->guest_paddr = paddr;
-        block->status      = JIT_NOJIT;
+        jit_mark_nojit(block, paddr, paddr, scan_bail);
         jit->bailed++;
         return NULL;
     }
@@ -1465,6 +1531,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     int      emitted_bytes = 0;
     int      emitted_insns = 0;
     bool     ok   = true;
+    uint16_t block_flags = JIT_BLOCKF_NONE;
     cur_eip = eip;
 
     for (int n = 0; n < insn_count; n++) {
@@ -1486,17 +1553,17 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
     if (!ok || p >= code_end) {
         if (emitted_bytes == 0) {
-            block->guest_paddr = paddr;
-            block->status      = JIT_NOJIT;
+            jit_mark_nojit(block, paddr, paddr, JIT_BAIL_HOST_BUFFER_FULL);
             jit->bailed++;
             return NULL;
         }
         /* Partial: emit epilogue */
-        if (p + 80 < code_end)
+        if (p + 80 < code_end) {
             emit_epilogue(&p, LX7_CPU_REG, cur_eip);
-        else {
-            block->guest_paddr = paddr;
-            block->status      = JIT_NOJIT;
+            block_flags |= JIT_BLOCKF_PARTIAL;
+        } else {
+            jit_mark_nojit(block, paddr, paddr + (uint32_t)emitted_bytes,
+                           JIT_BAIL_HOST_BUFFER_FULL);
             jit->bailed++;
             return NULL;
         }
@@ -1504,11 +1571,15 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
     /* Commit block */
     block->guest_paddr  = paddr;
+    block->guest_end    = paddr + (uint32_t)emitted_bytes;
     block->guest_cs_base= cs_base;
     block->host_code    = pool_start;
     block->host_len     = (uint16_t)(p - code_start);
     block->x86_len      = (uint16_t)emitted_bytes;
     block->x86_insns    = (uint16_t)emitted_insns;
+    block->flags        = block_flags | jit_block_flags_for_actions(actions, emitted_insns);
+    block->exit_kind    = jit_exit_kind_for_actions(actions, emitted_insns);
+    block->bail         = JIT_BAIL_NONE;
     block->status       = JIT_VALID;
 
 #ifdef BUILD_ESP32
