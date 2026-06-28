@@ -497,6 +497,7 @@ typedef enum {
     ACT_TEST_RR,    /* set test state: left_reg & right_reg */
     ACT_JMP,        /* unconditional jump; failed in BIOS relocation tests; needs tracing. */
     ACT_JCC,        /* conditional jump;   target_eip set */
+    ACT_CWDE,       /* EAX = sign_extend(AX), no flags */
     ACT_BLOCK_END,  /* last instruction of block, no jump */
 } ActionType;
 
@@ -549,6 +550,11 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
 
     if (op == 0x90) {
         a->type = ACT_NOP;
+        return len;
+    }
+
+    if (op == 0x98) {
+        a->type = ACT_CWDE;
         return len;
     }
 
@@ -781,6 +787,12 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     switch (a->type) {
 
     case ACT_NOP:
+        break;
+
+    case ACT_CWDE:
+        GUARD(6);
+        emit_slli(p, X86REG_TO_LX7(0), X86REG_TO_LX7(0), 16);
+        emit_srai(p, X86REG_TO_LX7(0), X86REG_TO_LX7(0), 16);
         break;
 
     /* ---- MOV ------------------------------------------------ */
@@ -1062,6 +1074,8 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
     if (TINY386_JIT_LEVEL <= 0)
         return false;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NOT_R)
+        return true;
+    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CWDE)
         return true;
     /*
      * Keep DEC disabled until the emitter preserves x86 lazy flags correctly.
