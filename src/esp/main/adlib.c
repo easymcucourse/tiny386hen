@@ -1,7 +1,7 @@
 /*
  * Adlib OPL2 backend for tiny386hen using emu8950.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: BSD-3-Clause
  */
 
 #include <stdint.h>

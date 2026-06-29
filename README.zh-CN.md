@@ -2,7 +2,9 @@
 
 [English](README.md)
 
-tiny386hen 是一个面向 ESP32-S3 的 DOS / 386 PC 模拟器固件项目。项目基于 Tiny386 参考代码，整理了 ESP32-S3 适配层、显示和存储驱动、SeaBIOS 构建流程，以及可直接烧录的固件产物。
+tiny386hen 是一个面向 ESP32-S3 的第三方 DOS / 386 PC 模拟器固件适配项目。项目使用 Tiny386 参考代码，并整理了 ESP32-S3 适配层、显示和存储驱动、SeaBIOS 构建流程，以及可直接烧录的固件产物。
+
+本项目是独立的第三方适配项目，与上游 Tiny386 项目无从属、维护、背书或官方发布关系。
 
 本项目的目标是在一块带 PSRAM、LCD 和 SD 卡的 ESP32-S3 开发板上运行 DOS 环境。外设参数通过 `tiny386.ini` 配置，常见硬件接线和启动参数可以直接改 ini 文件，不需要为了换屏幕、换 SD 接口或调整音频参数而重新修改固件源码。
 
@@ -243,4 +245,4 @@ make PYTHON=python3
 
 ## 许可证
 
-本项目以 MIT License 发布，详见 [LICENSE](LICENSE)。第三方参考项目保留原始许可证，详见 [copyright/README.zh-CN.md](copyright/README.zh-CN.md)。
+本项目以 BSD-3-Clause License 发布，详见 [LICENSE](LICENSE)。第三方参考项目保留原始许可证。本项目是独立第三方适配，与上游 Tiny386 项目无关联，详见 [copyright/README.zh-CN.md](copyright/README.zh-CN.md)。

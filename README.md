@@ -2,7 +2,9 @@
 
 [Chinese](README.zh-CN.md)
 
-tiny386hen is a DOS / 386 PC emulator firmware project for ESP32-S3. It is based on the Tiny386 reference code and collects the ESP32-S3 adaptation layer, display and storage drivers, SeaBIOS build flow, and ready-to-flash firmware outputs.
+tiny386hen is a third-party DOS / 386 PC emulator firmware adaptation for ESP32-S3. It uses Tiny386 reference code together with an ESP32-S3 adaptation layer, display and storage drivers, SeaBIOS build flow, and ready-to-flash firmware outputs.
+
+This project is an independent third-party adaptation. It is not affiliated with, maintained by, endorsed by, or an official release of the upstream Tiny386 project.
 
 The goal is to run a DOS environment on an ESP32-S3 board with PSRAM, an LCD, and an SD card. Peripheral parameters are configured through `tiny386.ini`, so common hardware wiring and boot options can be changed in the ini file without modifying the firmware source for every display, SD interface, or audio setting change.
 
@@ -243,4 +245,4 @@ The expected firmware images are `out/bios.bin` and `out/vgabios.bin`.
 
 ## License
 
-This project is released under the MIT License. See [LICENSE](LICENSE). Third-party reference projects keep their original licenses. See [copyright/README.zh-CN.md](copyright/README.zh-CN.md) for details.
+This project is released under the BSD-3-Clause License. See [LICENSE](LICENSE). Third-party reference projects keep their original licenses. This independent adaptation is not affiliated with the upstream Tiny386 project. See [copyright/README.zh-CN.md](copyright/README.zh-CN.md) for details.
