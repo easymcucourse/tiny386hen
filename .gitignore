@@ -2,6 +2,6 @@ make/esp-ili9341/build_*/
 make/esp-ili9341/managed_components/
 /build_*/
 /recordings/
-/refs/
+# refs/ contains git submodules; keep gitlink updates visible in the parent repo.
 dos.img
 dos - 副本.img
