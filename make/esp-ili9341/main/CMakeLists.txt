@@ -11,7 +11,7 @@ set(TINY386_CORE_SOURCES
     "${TINY386_REF_ROOT}/i8042.c"
     "${TINY386_REF_ROOT}/i8254.c"
     "${TINY386_REF_ROOT}/i8259.c"
-    "${TINY386_REF_ROOT}/ide.c"
+    "${TINY386_OVERLAY_ROOT}/ide.c"
     "${TINY386_REF_ROOT}/ini.c"
     "${TINY386_OVERLAY_ROOT}/pc.c"
     "${TINY386_REF_ROOT}/misc.c"
