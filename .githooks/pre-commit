@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+set -eu
+
+bad_paths=$(
+    git diff --cached --name-only --diff-filter=ACMR |
+    while IFS= read -r path; do
+        case "$path" in
+            refs/*/*)
+                printf '%s\n' "$path"
+                ;;
+        esac
+    done
+)
+
+if [ -n "$bad_paths" ]; then
+    printf '%s\n' "Refusing to commit regular files under refs/."
+    printf '%s\n' "refs/ is reserved for submodule gitlinks; update submodules by committing the refs/<name> gitlink only."
+    printf '%s\n' "$bad_paths"
+    exit 1
+fi
