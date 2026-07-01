@@ -849,3 +849,20 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **M3（P3 完成）**：JMP/Jcc/块链接可用，热路径基本被 JIT 覆盖。
 - **M4（P4 完成）**：SMC/缓存健壮，长时间运行不发散。
 - **M5（P5 完成）**：有性能基准与可量化收益，opcode 覆盖持续扩大。
+
+---
+
+## 2026-07-01 Execution Record (COM19, auto-run through Task 5.3)
+
+- Task 3.1 done: enabled `ACT_JMP` with `TINY386_JIT_LEVEL=3` / `TINY386_JIT_ENABLE_JMP=1`; added rel8/rel32 JMP selftests; board selftest and normal firmware smoke passed.
+- Task 3.2 done: enabled CMP_RR/CMP_RI/TEST_RR + Jcc fusion for supported cc set; added 32 taken/not-taken branch selftests; board selftest passed.
+- Task 3.3 done: changed Jcc emission to range-safe inverted short branch plus long `J` to the taken epilogue; unsupported conditions bail before emitting partial branch bytes.
+- Task 3.4 skipped for now: current JIT blocks are full Xtensa windowed ABI functions (`ENTRY` + `RETW.N`). Directly jumping into another block entry would nest/corrupt the call window and return chain. Revisit only after introducing a separate body-entry ABI or a trampoline/link stub model.
+- Task 4.1 done: verified cache slot conflict and pool-full flush paths with board selftests (`CACHE_CONFLICT`, `CACHE_POOL_FULL`).
+- Task 4.2 done: invalidates all JIT blocks on CR0 paging/WP/PE changes, CR3 writes, task-switch CR3 load, and CS code16/code32 transitions; selftest covers real interpreter `MOV CR3,EAX` invalidation.
+- Task 4.3 done: guest RAM stores now call JIT SMC invalidation after `pstore8/16/32` on non-MMIO physical writes, including split writes.
+- Task 4.4 done: added `jit_invalidate_range()` and a hashed translated-code page bitmap so normal data writes avoid scanning the JIT cache; selftests prove same-page non-overlap writes do not invalidate, overlap writes do invalidate and retranslate modified code.
+- Task 5.1 done: captured COM19 perf baseline with JIT level3 and temporary level0. In this boot window both reached `set VGA mode 1`; representative level3 samples were `ips=550889` at about 5.9s, `ips=1044520` at about 10.9s, and `ips=875941` at about 20.9s. Level0 samples were effectively similar for this workload, indicating current opcode coverage still misses the dominant DOS hot path.
+- Task 5.2 done: prologue/epilogue now use conservative per-block GPR masks; only read GPRs are loaded and only written GPRs are stored. This preserves the existing function ABI and avoids the Task 3.4 linking blocker.
+- Task 5.3 done: enabled `XCHG EAX,r32` at level3 and added `XCHG_EAX_EBX` / `XCHG_EAX_EDI` differential selftests.
+- Verification: final selftest-only firmware on COM19 reported `96/96 PASS`; final normal firmware build flashed over COM19 and reached `Booting from 0000:7c00` and `set VGA mode 1` within a 45s capture with no WDT or panic.

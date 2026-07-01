@@ -25,6 +25,7 @@
 #define ST_PHYS_SIZE   8192u
 #define ST_CODE_BASE   0x1000u
 #define ST_FLASH_PROBE_BYTES 256u
+#define ST_SEG_DS      3
 
 /* Mirror ActionType ordinals in jit_lx7.c (ACT_NONE=0). */
 #define ACT_NOP     1
@@ -37,6 +38,12 @@
 #define ACT_INC_R   8
 #define ACT_DEC_R   9
 #define ACT_SHx_RI  10
+#define ACT_CMP_RR  12
+#define ACT_CMP_RI  13
+#define ACT_TEST_RR 14
+#define ACT_JMP     15
+#define ACT_JCC     16
+#define ACT_XCHG_EAX_R 19
 
 #define JIT_ST_ALLOW(act)  (1u << (unsigned)(act))
 
@@ -100,6 +107,22 @@ typedef struct {
 	uint8_t count;
 } ShiftSelftestCase;
 
+typedef enum {
+	BR_SRC_CMP_RR,
+	BR_SRC_CMP_RI,
+	BR_SRC_TEST_RR,
+} BranchSourceOp;
+
+typedef struct {
+	const char *name;
+	BranchSourceOp src_op;
+	uint8_t cc;
+	uint32_t eax;
+	uint32_t ebx;
+	int8_t imm8;
+	bool expect_taken;
+} BranchSelftestCase;
+
 static const uint8_t code_nop[] = { 0x90 };
 static const uint8_t code_mov_eax[] = { 0xB8, 0x78, 0x56, 0x34, 0x12 };
 static const uint8_t code_mov_ebx_neg[] = { 0xBB, 0x00, 0x00, 0x00, 0x80 };
@@ -127,6 +150,21 @@ static const uint8_t code_not_eax[] = { 0xF7, 0xD0 };
 static const uint8_t code_neg_eax[] = { 0xF7, 0xD8 };
 static const uint8_t code_inc_eax[] = { 0x40 };
 static const uint8_t code_dec_eax[] = { 0x48 };
+static const uint8_t code_xchg_eax_ebx[] = { 0x93 };
+static const uint8_t code_xchg_eax_edi[] = { 0x97 };
+static const uint8_t code_jmp_rel8[] = {
+	0xEB, 0x03,                   /* jmp +3 */
+	0xB8, 0x11, 0x11, 0x11, 0x11, /* skipped */
+	0xBB, 0x22, 0x22, 0x22, 0x22, /* target */
+};
+static const uint8_t code_jmp_rel32[] = {
+	0xE9, 0x05, 0x00, 0x00, 0x00, /* jmp +5 */
+	0xB8, 0x33, 0x33, 0x33, 0x33, /* skipped */
+	0xBB, 0x44, 0x44, 0x44, 0x44, /* target */
+};
+static const uint8_t code_mov_cr3_eax[] = {
+	0x0F, 0x22, 0xD8,             /* mov cr3,eax */
+};
 
 static uint8_t build_alu_code(const AluSelftestCase *tc, uint8_t *code)
 {
@@ -192,6 +230,31 @@ static uint8_t build_shift_code(const ShiftSelftestCase *tc, uint8_t *code)
 	}
 	code[2] = tc->count;
 	return 3;
+}
+
+static uint8_t build_branch_code(const BranchSelftestCase *tc, uint8_t *code)
+{
+	uint8_t len = 0;
+
+	switch (tc->src_op) {
+	case BR_SRC_CMP_RR:
+		code[len++] = 0x39; code[len++] = 0xD8; /* cmp eax,ebx */
+		break;
+	case BR_SRC_CMP_RI:
+		code[len++] = 0x83; code[len++] = 0xF8; code[len++] = (uint8_t)tc->imm8; /* cmp eax,imm8 */
+		break;
+	case BR_SRC_TEST_RR:
+		code[len++] = 0x85; code[len++] = 0xD8; /* test eax,ebx */
+		break;
+	default:
+		return 0;
+	}
+
+	code[len++] = (uint8_t)(0x70u | (tc->cc & 0x0fu)); /* jcc +5 */
+	code[len++] = 0x05;
+	code[len++] = 0xB8; code[len++] = 0x11; code[len++] = 0x11; code[len++] = 0x11; code[len++] = 0x11;
+	code[len++] = 0xBB; code[len++] = 0x22; code[len++] = 0x22; code[len++] = 0x22; code[len++] = 0x22;
+	return len;
 }
 
 static const esp_partition_t *find_flash_probe_partition(void)
@@ -735,6 +798,222 @@ static bool run_shift_case(CPUI386 *cpu, uint8_t *mem,
 	return true;
 }
 
+static void setup_branch_cpu(CPUI386 *cpu, uint8_t *mem,
+			     const BranchSelftestCase *tc)
+{
+	uint8_t code[16];
+	uint8_t code_len = build_branch_code(tc, code);
+
+	cpui386_reset_pm(cpu, ST_CODE_BASE);
+	memset(mem + ST_CODE_BASE, 0xcc, 64);
+	memcpy(mem + ST_CODE_BASE, code, code_len);
+	cpui386_set_gpr(cpu, 0, tc->eax);
+	cpui386_set_gpr(cpu, 3, tc->ebx);
+	for (int i = 1; i < 8; i++) {
+		if (i != 3)
+			cpui386_set_gpr(cpu, i, 0x71727374u + (uint32_t)i);
+	}
+	cpu_setflags(cpu, 0, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF);
+	jit_cpu_prepare_exec(cpu, ST_CODE_BASE);
+}
+
+static bool run_branch_case(CPUI386 *cpu, uint8_t *mem,
+			    const BranchSelftestCase *tc)
+{
+	JITCpuSnapshot baseline;
+	JITCpuSnapshot interp_result;
+	JITCpuSnapshot jit_result;
+	uint32_t allow = JIT_ST_ALLOW(ACT_JCC);
+	int interp_steps;
+	int jit_steps;
+
+	switch (tc->src_op) {
+	case BR_SRC_CMP_RR:  allow |= JIT_ST_ALLOW(ACT_CMP_RR); break;
+	case BR_SRC_CMP_RI:  allow |= JIT_ST_ALLOW(ACT_CMP_RI); break;
+	case BR_SRC_TEST_RR: allow |= JIT_ST_ALLOW(ACT_TEST_RR); break;
+	}
+
+	setup_branch_cpu(cpu, mem, tc);
+	jit_cpu_snapshot(cpu, &baseline);
+
+	jit_cpu_restore(cpu, &baseline);
+	interp_steps = jit_cpu_step_interp(cpu, 2);
+	jit_cpu_snapshot(cpu, &interp_result);
+
+	jit_cpu_invalidate_cache(cpu);
+	jit_cpu_restore(cpu, &baseline);
+	jit_selftest_set_allowed_actions(allow);
+	jit_steps = jit_cpu_step_jit(cpu, 2);
+	jit_selftest_clear_allowed_actions();
+	jit_cpu_snapshot(cpu, &jit_result);
+
+	if (interp_steps != 2) {
+		esp_rom_printf("[jit_selftest] FAIL %s: interpreter steps %d != 2\n",
+			       tc->name, interp_steps);
+		return false;
+	}
+	if (jit_steps != 2) {
+		esp_rom_printf("[jit_selftest] FAIL %s: JIT steps %d != 2\n",
+			       tc->name, jit_steps);
+		return false;
+	}
+	if (!compare_snapshots(tc->name, &interp_result, &jit_result))
+		return false;
+
+	esp_rom_printf("[jit_selftest] PASS %s (interp=%d jit=%d taken=%d)\n",
+		       tc->name, interp_steps, jit_steps, (int)tc->expect_taken);
+	return true;
+}
+
+static bool run_cache_metadata_cases(CPUI386 *cpu, uint8_t *mem)
+{
+	const uint32_t addr1 = ST_CODE_BASE;
+	const uint32_t addr2 = ST_CODE_BASE + JIT_CACHE_ENTRIES;
+	uint32_t slot1 = (addr1 * 2654435761u) % JIT_CACHE_ENTRIES;
+	uint32_t slot2 = (addr2 * 2654435761u) % JIT_CACHE_ENTRIES;
+	uint32_t epoch_before;
+
+	memset(mem + addr1, 0xcc, 64);
+	memset(mem + addr2, 0xcc, 64);
+	mem[addr1 + 0] = 0xB8; mem[addr1 + 1] = 0x11; mem[addr1 + 2] = 0x11;
+	mem[addr1 + 3] = 0x11; mem[addr1 + 4] = 0x11;
+	mem[addr2 + 0] = 0xB8; mem[addr2 + 1] = 0x22; mem[addr2 + 2] = 0x22;
+	mem[addr2 + 3] = 0x22; mem[addr2 + 4] = 0x22;
+
+	if (slot1 != slot2) {
+		esp_rom_printf("[jit_selftest] FAIL CACHE_CONFLICT: slots %u/%u differ\n",
+			       (unsigned)slot1, (unsigned)slot2);
+		return false;
+	}
+
+	jit_cpu_invalidate_cache(cpu);
+	cpui386_reset_pm(cpu, addr1);
+	jit_cpu_prepare_exec(cpu, addr1);
+	if (jit_cpu_step_jit(cpu, 1) != 1 || jit_cpu_get_gpr(cpu, 0) != 0x11111111u) {
+		esp_rom_printf("[jit_selftest] FAIL CACHE_CONFLICT: first block result bad\n");
+		return false;
+	}
+
+	cpui386_set_gpr(cpu, 0, 0);
+	jit_cpu_prepare_exec(cpu, addr2);
+	if (jit_cpu_step_jit(cpu, 1) != 1 || jit_cpu_get_gpr(cpu, 0) != 0x22222222u) {
+		esp_rom_printf("[jit_selftest] FAIL CACHE_CONFLICT: second block result bad\n");
+		return false;
+	}
+	esp_rom_printf("[jit_selftest] PASS CACHE_CONFLICT (slot=%u)\n", (unsigned)slot1);
+
+	epoch_before = jit_selftest_get_pool_epoch(cpu);
+	jit_selftest_force_pool_used(cpu, JIT_POOL_SIZE - 4u);
+	cpui386_set_gpr(cpu, 0, 0);
+	jit_cpu_prepare_exec(cpu, addr1);
+	if (jit_cpu_step_jit(cpu, 1) != 1 || jit_cpu_get_gpr(cpu, 0) != 0x11111111u) {
+		esp_rom_printf("[jit_selftest] FAIL CACHE_POOL_FULL: execution after flush failed\n");
+		return false;
+	}
+	if (jit_selftest_get_pool_epoch(cpu) == epoch_before) {
+		esp_rom_printf("[jit_selftest] FAIL CACHE_POOL_FULL: epoch did not advance\n");
+		return false;
+	}
+	esp_rom_printf("[jit_selftest] PASS CACHE_POOL_FULL (epoch %u->%u)\n",
+		       (unsigned)epoch_before, (unsigned)jit_selftest_get_pool_epoch(cpu));
+	return true;
+}
+
+static bool run_state_invalidation_cases(CPUI386 *cpu, uint8_t *mem)
+{
+	uint32_t epoch_before;
+	uint32_t epoch_after;
+
+	memset(mem + ST_CODE_BASE, 0xcc, 64);
+	memcpy(mem + ST_CODE_BASE, code_mov_eax, sizeof(code_mov_eax));
+
+	jit_cpu_invalidate_cache(cpu);
+	cpui386_reset_pm(cpu, ST_CODE_BASE);
+	jit_cpu_prepare_exec(cpu, ST_CODE_BASE);
+	if (jit_cpu_step_jit(cpu, 1) != 1 || jit_cpu_get_gpr(cpu, 0) != 0x12345678u) {
+		esp_rom_printf("[jit_selftest] FAIL STATE_CR3_INVALIDATE: warmup JIT block failed\n");
+		return false;
+	}
+
+	epoch_before = jit_selftest_get_pool_epoch(cpu);
+	memset(mem + ST_CODE_BASE, 0xcc, 64);
+	memcpy(mem + ST_CODE_BASE, code_mov_cr3_eax, sizeof(code_mov_cr3_eax));
+	cpui386_set_gpr(cpu, 0, 0x00003000u);
+	jit_cpu_prepare_exec(cpu, ST_CODE_BASE);
+	if (jit_cpu_step_interp(cpu, 1) != 1) {
+		esp_rom_printf("[jit_selftest] FAIL STATE_CR3_INVALIDATE: interpreter MOV CR3 failed\n");
+		return false;
+	}
+
+	epoch_after = jit_selftest_get_pool_epoch(cpu);
+	if (epoch_after == epoch_before) {
+		esp_rom_printf("[jit_selftest] FAIL STATE_CR3_INVALIDATE: epoch did not advance\n");
+		return false;
+	}
+	esp_rom_printf("[jit_selftest] PASS STATE_CR3_INVALIDATE (epoch %u->%u)\n",
+		       (unsigned)epoch_before, (unsigned)epoch_after);
+	return true;
+}
+
+static bool run_smc_invalidation_cases(CPUI386 *cpu, uint8_t *mem)
+{
+	uint32_t invalid_before;
+	uint32_t flush_before;
+
+	memset(mem + ST_CODE_BASE, 0xcc, 64);
+	memcpy(mem + ST_CODE_BASE, code_mov_eax, sizeof(code_mov_eax));
+
+	jit_cpu_invalidate_cache(cpu);
+	cpui386_reset_pm(cpu, ST_CODE_BASE);
+	jit_cpu_prepare_exec(cpu, ST_CODE_BASE);
+	if (jit_cpu_step_jit(cpu, 1) != 1 || jit_cpu_get_gpr(cpu, 0) != 0x12345678u) {
+		esp_rom_printf("[jit_selftest] FAIL SMC_RANGE_OVERLAP: warmup JIT block failed\n");
+		return false;
+	}
+
+	invalid_before = jit_selftest_get_invalidations(cpu);
+	flush_before = jit_selftest_get_smc_flushes(cpu);
+	if (!cpu_store8(cpu, ST_SEG_DS, ST_CODE_BASE + 16u, 0x90)) {
+		esp_rom_printf("[jit_selftest] FAIL SMC_RANGE_NONOVERLAP: cpu_store8 failed\n");
+		return false;
+	}
+	if (jit_selftest_get_smc_flushes(cpu) != flush_before + 1u ||
+	    jit_selftest_get_invalidations(cpu) != invalid_before) {
+		esp_rom_printf("[jit_selftest] FAIL SMC_RANGE_NONOVERLAP: flush/invalidation %u/%u -> %u/%u\n",
+			       (unsigned)flush_before, (unsigned)invalid_before,
+			       (unsigned)jit_selftest_get_smc_flushes(cpu),
+			       (unsigned)jit_selftest_get_invalidations(cpu));
+		return false;
+	}
+	esp_rom_printf("[jit_selftest] PASS SMC_RANGE_NONOVERLAP (invalidations=%u)\n",
+		       (unsigned)invalid_before);
+
+	flush_before = jit_selftest_get_smc_flushes(cpu);
+	if (!cpu_store8(cpu, ST_SEG_DS, ST_CODE_BASE + 1u, 0x9a)) {
+		esp_rom_printf("[jit_selftest] FAIL SMC_RANGE_OVERLAP: cpu_store8 failed\n");
+		return false;
+	}
+	if (jit_selftest_get_smc_flushes(cpu) != flush_before + 1u ||
+	    jit_selftest_get_invalidations(cpu) != invalid_before + 1u) {
+		esp_rom_printf("[jit_selftest] FAIL SMC_RANGE_OVERLAP: flush/invalidation %u/%u -> %u/%u\n",
+			       (unsigned)flush_before, (unsigned)invalid_before,
+			       (unsigned)jit_selftest_get_smc_flushes(cpu),
+			       (unsigned)jit_selftest_get_invalidations(cpu));
+		return false;
+	}
+
+	cpui386_set_gpr(cpu, 0, 0);
+	jit_cpu_prepare_exec(cpu, ST_CODE_BASE);
+	if (jit_cpu_step_jit(cpu, 1) != 1 || jit_cpu_get_gpr(cpu, 0) != 0x1234569au) {
+		esp_rom_printf("[jit_selftest] FAIL SMC_RANGE_OVERLAP: modified block did not retranslate\n");
+		return false;
+	}
+	esp_rom_printf("[jit_selftest] PASS SMC_RANGE_OVERLAP (invalidations %u->%u)\n",
+		       (unsigned)invalid_before,
+		       (unsigned)jit_selftest_get_invalidations(cpu));
+	return true;
+}
+
 int jit_selftest_run(void)
 {
 	static const SelftestCase cases[] = {
@@ -822,6 +1101,20 @@ int jit_selftest_run(void)
 			.jit_allow = JIT_ST_ALLOW(ACT_DEC_R),
 			.init = init_dec_cf_clear_state,
 		},
+		{
+			.name = "XCHG_EAX_EBX",
+			.code = code_xchg_eax_ebx,
+			.code_len = sizeof(code_xchg_eax_ebx),
+			.jit_allow = JIT_ST_ALLOW(ACT_XCHG_EAX_R),
+			.init = init_mov_rr_state,
+		},
+		{
+			.name = "XCHG_EAX_EDI",
+			.code = code_xchg_eax_edi,
+			.code_len = sizeof(code_xchg_eax_edi),
+			.jit_allow = JIT_ST_ALLOW(ACT_XCHG_EAX_R),
+			.init = init_mov_rr_state,
+		},
 	};
 	static const SelftestCase mixed_nop_mov = {
 		.name = "MIXED_NOP_THEN_MOV_EAX",
@@ -852,6 +1145,20 @@ int jit_selftest_run(void)
 		.code_len = sizeof(code_block_add_add_cover_flags),
 		.jit_allow = JIT_ST_ALLOW(ACT_ALU_RR),
 		.init = init_dead_flags_add_state,
+	};
+	static const SelftestCase block_jmp_rel8 = {
+		.name = "BLOCK_JMP_REL8",
+		.code = code_jmp_rel8,
+		.code_len = sizeof(code_jmp_rel8),
+		.jit_allow = JIT_ST_ALLOW(ACT_JMP),
+		.init = init_mov_ebx_state,
+	};
+	static const SelftestCase block_jmp_rel32 = {
+		.name = "BLOCK_JMP_REL32",
+		.code = code_jmp_rel32,
+		.code_len = sizeof(code_jmp_rel32),
+		.jit_allow = JIT_ST_ALLOW(ACT_JMP),
+		.init = init_mov_ebx_state,
 	};
 	static const AluSelftestCase alu_cases[] = {
 		{ "ADD_RR_zero",      ALU_ST_ADD_RR, 0x00000000u, 0x00000000u, 0 },
@@ -895,15 +1202,53 @@ int jit_selftest_run(void)
 		{ "SAR_RI_count4", SHIFT_ST_SAR, 0xf000000fu, 4 },
 		{ "SAR_RI_count31", SHIFT_ST_SAR, 0x80000000u, 31 },
 	};
+	static const BranchSelftestCase branch_cases[] = {
+		{ "CMP_RR_JZ_taken",    BR_SRC_CMP_RR,  4, 5,          5,          0, true },
+		{ "CMP_RR_JZ_not",      BR_SRC_CMP_RR,  4, 5,          6,          0, false },
+		{ "CMP_RR_JNZ_taken",   BR_SRC_CMP_RR,  5, 5,          6,          0, true },
+		{ "CMP_RR_JNZ_not",     BR_SRC_CMP_RR,  5, 5,          5,          0, false },
+		{ "CMP_RR_JB_taken",    BR_SRC_CMP_RR,  2, 1,          2,          0, true },
+		{ "CMP_RR_JB_not",      BR_SRC_CMP_RR,  2, 2,          1,          0, false },
+		{ "CMP_RR_JNB_taken",   BR_SRC_CMP_RR,  3, 2,          1,          0, true },
+		{ "CMP_RR_JNB_not",     BR_SRC_CMP_RR,  3, 1,          2,          0, false },
+		{ "CMP_RR_JBE_taken",   BR_SRC_CMP_RR,  6, 1,          2,          0, true },
+		{ "CMP_RR_JBE_not",     BR_SRC_CMP_RR,  6, 3,          2,          0, false },
+		{ "CMP_RR_JNBE_taken",  BR_SRC_CMP_RR,  7, 3,          2,          0, true },
+		{ "CMP_RR_JNBE_not",    BR_SRC_CMP_RR,  7, 1,          2,          0, false },
+		{ "CMP_RR_JL_taken",    BR_SRC_CMP_RR, 12, 0xffffffffu,1,          0, true },
+		{ "CMP_RR_JL_not",      BR_SRC_CMP_RR, 12, 1,          0xffffffffu,0, false },
+		{ "CMP_RR_JNL_taken",   BR_SRC_CMP_RR, 13, 1,          0xffffffffu,0, true },
+		{ "CMP_RR_JNL_not",     BR_SRC_CMP_RR, 13, 0xffffffffu,1,          0, false },
+		{ "CMP_RR_JLE_taken",   BR_SRC_CMP_RR, 14, 0xffffffffu,1,          0, true },
+		{ "CMP_RR_JLE_not",     BR_SRC_CMP_RR, 14, 1,          0xffffffffu,0, false },
+		{ "CMP_RR_JNLE_taken",  BR_SRC_CMP_RR, 15, 1,          0xffffffffu,0, true },
+		{ "CMP_RR_JNLE_not",    BR_SRC_CMP_RR, 15, 0xffffffffu,1,          0, false },
+		{ "CMP_RI_JS_taken",    BR_SRC_CMP_RI,  8, 1,          0,          2, true },
+		{ "CMP_RI_JS_not",      BR_SRC_CMP_RI,  8, 2,          0,          1, false },
+		{ "CMP_RI_JNS_taken",   BR_SRC_CMP_RI,  9, 2,          0,          1, true },
+		{ "CMP_RI_JNS_not",     BR_SRC_CMP_RI,  9, 1,          0,          2, false },
+		{ "TEST_RR_JZ_taken",   BR_SRC_TEST_RR, 4, 0x0f0f0000u,0x0000f0f0u,0, true },
+		{ "TEST_RR_JZ_not",     BR_SRC_TEST_RR, 4, 0x0f0f0000u,0x000f0000u,0, false },
+		{ "TEST_RR_JNZ_taken",  BR_SRC_TEST_RR, 5, 0x0f0f0000u,0x000f0000u,0, true },
+		{ "TEST_RR_JNZ_not",    BR_SRC_TEST_RR, 5, 0x0f0f0000u,0x0000f0f0u,0, false },
+		{ "TEST_RR_JS_taken",   BR_SRC_TEST_RR, 8, 0x80000000u,0xffffffffu,0, true },
+		{ "TEST_RR_JS_not",     BR_SRC_TEST_RR, 8, 0x7fffffffu,0xffffffffu,0, false },
+		{ "TEST_RR_JNS_taken",  BR_SRC_TEST_RR, 9, 0x7fffffffu,0xffffffffu,0, true },
+		{ "TEST_RR_JNS_not",    BR_SRC_TEST_RR, 9, 0x80000000u,0xffffffffu,0, false },
+	};
 	FlashReadProbe flash_before;
 	FlashReadProbe flash_after;
 	bool flash_before_ok;
 	const unsigned case_count = (unsigned)(sizeof(cases) / sizeof(cases[0]));
 	const unsigned mixed_count = 2u;
-	const unsigned block_count = 2u;
+	const unsigned block_count = 4u;
 	const unsigned alu_count = (unsigned)(sizeof(alu_cases) / sizeof(alu_cases[0]));
 	const unsigned shift_count = (unsigned)(sizeof(shift_cases) / sizeof(shift_cases[0]));
-	const unsigned check_count = case_count + mixed_count + block_count + alu_count + shift_count + 1u;
+	const unsigned branch_count = (unsigned)(sizeof(branch_cases) / sizeof(branch_cases[0]));
+	const unsigned cache_count = 2u;
+	const unsigned state_count = 1u;
+	const unsigned smc_count = 2u;
+	const unsigned check_count = case_count + mixed_count + block_count + alu_count + shift_count + branch_count + cache_count + state_count + smc_count + 1u;
 	uint8_t *mem;
 	CPUI386 *cpu;
 	int failures = 0;
@@ -913,8 +1258,8 @@ int jit_selftest_run(void)
 		return 1;
 	}
 
-	esp_rom_printf("[jit_selftest] start (%u cases + %u mixed + %u block + %u alu + %u shift + flash probe)\n",
-		       case_count, mixed_count, block_count, alu_count, shift_count);
+	esp_rom_printf("[jit_selftest] start (%u cases + %u mixed + %u block + %u alu + %u shift + %u branch + %u cache + %u state + %u smc + flash probe)\n",
+		       case_count, mixed_count, block_count, alu_count, shift_count, branch_count, cache_count, state_count, smc_count);
 
 	flash_before_ok = read_flash_probe("before_jit", &flash_before);
 	if (!flash_before_ok)
@@ -947,6 +1292,10 @@ int jit_selftest_run(void)
 		failures++;
 	if (!run_block_case(cpu, mem, &block_add_add_cover_flags, 2))
 		failures++;
+	if (!run_mixed_case(cpu, mem, &block_jmp_rel8, 2, 1))
+		failures++;
+	if (!run_mixed_case(cpu, mem, &block_jmp_rel32, 2, 1))
+		failures++;
 	for (size_t i = 0; i < alu_count; i++) {
 		if (!run_alu_case(cpu, mem, &alu_cases[i]))
 			failures++;
@@ -955,6 +1304,16 @@ int jit_selftest_run(void)
 		if (!run_shift_case(cpu, mem, &shift_cases[i]))
 			failures++;
 	}
+	for (size_t i = 0; i < branch_count; i++) {
+		if (!run_branch_case(cpu, mem, &branch_cases[i]))
+			failures++;
+	}
+	if (!run_cache_metadata_cases(cpu, mem))
+		failures += (int)cache_count;
+	if (!run_state_invalidation_cases(cpu, mem))
+		failures += (int)state_count;
+	if (!run_smc_invalidation_cases(cpu, mem))
+		failures += (int)smc_count;
 
 	if (flash_before_ok) {
 		if (!read_flash_probe("after_jit", &flash_after) ||

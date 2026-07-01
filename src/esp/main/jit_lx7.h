@@ -59,6 +59,10 @@ bool jit_pool_ready(void);
  */
 void jit_selftest_set_allowed_actions(uint32_t mask);
 void jit_selftest_clear_allowed_actions(void);
+uint32_t jit_selftest_get_pool_epoch(CPUI386 *cpu);
+void jit_selftest_force_pool_used(CPUI386 *cpu, uint32_t pool_used);
+uint32_t jit_selftest_get_invalidations(CPUI386 *cpu);
+uint32_t jit_selftest_get_smc_flushes(CPUI386 *cpu);
 #endif
 
 #endif /* JIT_LX7_H */

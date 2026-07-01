@@ -537,20 +537,24 @@ static int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
 #define GPR_OFF(i)  ((i) * 4)           /* 0, 4, 8, … 28 */
 #define NEXT_IP_OFF (8 * 4 + 4)         /* gprx[8]*4 bytes + ip(4) = 36 */
 
-/* Emit prologue: ENTRY + load all 8 x86 GPRs from cpu->gprx[] */
-static void emit_prologue(EmitPtr *p, int cpu_reg)
+/* Emit prologue: ENTRY + load only x86 GPRs read by this block. */
+static void emit_prologue(EmitPtr *p, int cpu_reg, uint8_t load_mask)
 {
     emit_entry32(p);
     for (int i = 0; i < 8; i++) {
+        if (!(load_mask & (1u << i)))
+            continue;
         /* L32I a(LX7_GPR_BASE+i), a(cpu_reg), GPR_OFF(i)/4 */
         emit_l32i(p, LX7_GPR_BASE + i, cpu_reg, GPR_OFF(i) / 4);
     }
 }
 
-/* Emit epilogue: store all 8 x86 GPRs back, set next_ip, RETW.N */
-static void emit_epilogue(EmitPtr *p, int cpu_reg, uint32_t next_ip)
+/* Emit epilogue: store modified x86 GPRs back, set next_ip, RETW.N */
+static void emit_epilogue(EmitPtr *p, int cpu_reg, uint32_t next_ip, uint8_t store_mask)
 {
     for (int i = 0; i < 8; i++) {
+        if (!(store_mask & (1u << i)))
+            continue;
         emit_s32i(p, LX7_GPR_BASE + i, cpu_reg, GPR_OFF(i) / 4);
     }
     /* Set cpu->next_ip = next_ip */
@@ -680,6 +684,75 @@ static const char *jit_action_name(ActionType type)
     case ACT_BLOCK_END:   return "BLOCK_END";
     default:              return "?";
     }
+}
+
+static void jit_action_reg_masks(const X86Action *a, uint8_t *read_mask, uint8_t *write_mask)
+{
+    uint8_t dst = (uint8_t)(1u << a->dst);
+    uint8_t src = (uint8_t)(1u << a->src);
+
+    switch (a->type) {
+    case ACT_MOV_RR:
+        *read_mask |= src;
+        *write_mask |= dst;
+        break;
+    case ACT_MOV_RI:
+        *write_mask |= dst;
+        break;
+    case ACT_ALU_RR:
+    case ACT_CMP_RR:
+    case ACT_TEST_RR:
+        *read_mask |= dst | src;
+        if (a->type == ACT_ALU_RR)
+            *write_mask |= dst;
+        break;
+    case ACT_ALU_RI:
+    case ACT_NOT_R:
+    case ACT_NEG_R:
+    case ACT_INC_R:
+    case ACT_DEC_R:
+    case ACT_SHx_RI:
+    case ACT_CMP_RI:
+        *read_mask |= dst;
+        if (a->type != ACT_CMP_RI)
+            *write_mask |= dst;
+        break;
+    case ACT_SHx_CL:
+        *read_mask |= dst | (1u << 1);
+        *write_mask |= dst;
+        break;
+    case ACT_CWDE:
+        *read_mask |= 1u << 0;
+        *write_mask |= 1u << 0;
+        break;
+    case ACT_CDQ:
+        *read_mask |= 1u << 0;
+        *write_mask |= 1u << 2;
+        break;
+    case ACT_XCHG_EAX_R:
+        *read_mask |= (1u << 0) | src;
+        *write_mask |= (1u << 0) | src;
+        break;
+    case ACT_BSWAP_R:
+        *read_mask |= dst;
+        *write_mask |= dst;
+        break;
+    default:
+        break;
+    }
+}
+
+static void jit_actions_reg_masks(const X86Action *actions, int count,
+                                  uint8_t *load_mask, uint8_t *store_mask)
+{
+    uint8_t read_mask = 0;
+    uint8_t write_mask = 0;
+
+    for (int i = 0; i < count; i++)
+        jit_action_reg_masks(&actions[i], &read_mask, &write_mask);
+
+    *load_mask = read_mask;
+    *store_mask = write_mask;
 }
 
 /*
@@ -946,7 +1019,8 @@ typedef struct {
  */
 static bool emit_action(EmitPtr *p, uint8_t *buf_end,
                          const X86Action *a, CmpState *cs,
-                         uint32_t fallback_eip, int cpu_reg)
+                         uint32_t fallback_eip, int cpu_reg,
+                         uint8_t store_mask)
 {
 #define GUARD(n) if ((*p) + (n) > buf_end) return false
 
@@ -1292,7 +1366,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
          * the interpreter path.
          */
         GUARD(16 * 4);
-        emit_epilogue(p, cpu_reg, a->target_eip);
+        emit_epilogue(p, cpu_reg, a->target_eip, store_mask);
         break;
 
     /* ---- Conditional jump (fused CMP/TEST + Jcc) ----------- */
@@ -1309,77 +1383,102 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
          * use a fixed worst-case size (16*4 bytes) and insert a
          * placeholder, then back-patch.
          */
-        GUARD(3 + 16 * 4 * 2 + 16);
-
-        uint8_t *branch_site = *p;
-        *p += 3; /* placeholder for the branch instruction */
-
-        /* Fallthrough epilogue */
-        emit_epilogue(p, cpu_reg, fallback_eip);
-        uint8_t *taken_start = *p;
-
-        /* Taken epilogue */
-        emit_epilogue(p, cpu_reg, a->target_eip);
-
-        /* Xtensa 3-byte branch displacement is relative to PC+4. */
-        int32_t br_off = (int32_t)(taken_start - (branch_site + 4));
-
-        EmitPtr bp = branch_site;
         int lx7l = cs->cmp_lreg;
         int lx7r = cs->cmp_rreg;
+        int zreg = (cs->cmp_mode == 2) ? cs->cmp_tmp : lx7l;
+        CondCode branch_cc = (CondCode)((unsigned)a->cc ^ 1u);
+        bool supported = false;
 
         if (cs->cmp_mode == 0) {
             return false;
         }
 
-        /* Fuse CMP + Jcc into a single LX7 branch */
-        /* Offset for zero/sign branches: 12-bit RI field */
-        int zreg = (cs->cmp_mode == 2) ? cs->cmp_tmp : lx7l;
-
         switch (a->cc) {
+        case CC_Z:
+        case CC_NZ:
+            supported = true;
+            break;
+        case CC_L:
+        case CC_NL:
+        case CC_LE:
+        case CC_NLE:
+        case CC_B:
+        case CC_NB:
+        case CC_BE:
+        case CC_NBE:
+            supported = (cs->cmp_mode == 1 || cs->cmp_mode == 2);
+            break;
+        case CC_S:
+        case CC_NS:
+            supported = (cs->cmp_mode == 2 || cs->cmp_mode == 3);
+            break;
+        default:
+            supported = false;
+            break;
+        }
+        if (!supported)
+            return false;
+
+        GUARD(3 + 3 + 16 * 4 * 2 + 16);
+
+        uint8_t *branch_site = *p;
+        *p += 3; /* placeholder for inverted conditional skip */
+        uint8_t *j_site = *p;
+        *p += 3; /* placeholder for long jump to taken path */
+
+        emit_epilogue(p, cpu_reg, fallback_eip, store_mask);
+        uint8_t *taken_start = *p;
+        emit_epilogue(p, cpu_reg, a->target_eip, store_mask);
+
+        EmitPtr bp = branch_site;
+        int32_t skip_j_off = (int32_t)((j_site + 3) - (branch_site + 4));
+
+        switch (branch_cc) {
         /* Equal / not-equal: use two-register BEQ/BNE when we have a
          * register pair, otherwise fall back to BEQZ/BNEZ on tmp.    */
         case CC_Z:
-            if (cs->cmp_mode == 1)      emit_beq (&bp, lx7l, lx7r, (int8_t)br_off);
-            else                        emit_beqz(&bp, zreg,         br_off & 0xFFF);
+            if (cs->cmp_mode == 1)      emit_beq (&bp, lx7l, lx7r, (int8_t)skip_j_off);
+            else                        emit_beqz(&bp, zreg,         skip_j_off & 0xFFF);
             break;
         case CC_NZ:
-            if (cs->cmp_mode == 1)      emit_bne (&bp, lx7l, lx7r, (int8_t)br_off);
-            else                        emit_bnez(&bp, zreg,         br_off & 0xFFF);
+            if (cs->cmp_mode == 1)      emit_bne (&bp, lx7l, lx7r, (int8_t)skip_j_off);
+            else                        emit_bnez(&bp, zreg,         skip_j_off & 0xFFF);
             break;
         /* Signed comparisons */
-        case CC_L:   emit_blt (&bp, lx7l, lx7r, (int8_t)br_off); break;
-        case CC_NL:  emit_bge (&bp, lx7l, lx7r, (int8_t)br_off); break;
+        case CC_L:   emit_blt (&bp, lx7l, lx7r, (int8_t)skip_j_off); break;
+        case CC_NL:  emit_bge (&bp, lx7l, lx7r, (int8_t)skip_j_off); break;
         case CC_LE:
-            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_bge(&bp, lx7r, lx7l, (int8_t)br_off);
+            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_bge(&bp, lx7r, lx7l, (int8_t)skip_j_off);
             else                                        return false;
             break;
         case CC_NLE:
-            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_blt(&bp, lx7r, lx7l, (int8_t)br_off);
+            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_blt(&bp, lx7r, lx7l, (int8_t)skip_j_off);
             else                                        return false;
             break;
         /* Unsigned comparisons */
-        case CC_B:   emit_bltu(&bp, lx7l, lx7r, (int8_t)br_off); break;
-        case CC_NB:  emit_bgeu(&bp, lx7l, lx7r, (int8_t)br_off); break;
+        case CC_B:   emit_bltu(&bp, lx7l, lx7r, (int8_t)skip_j_off); break;
+        case CC_NB:  emit_bgeu(&bp, lx7l, lx7r, (int8_t)skip_j_off); break;
         case CC_BE:
-            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_bgeu(&bp, lx7r, lx7l, (int8_t)br_off);
+            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_bgeu(&bp, lx7r, lx7l, (int8_t)skip_j_off);
             else                                        return false;
             break;
         case CC_NBE:
-            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_bltu(&bp, lx7r, lx7l, (int8_t)br_off);
+            if (cs->cmp_mode == 1 || cs->cmp_mode == 2) emit_bltu(&bp, lx7r, lx7l, (int8_t)skip_j_off);
             else                                        return false;
             break;
         /* Sign-flag test (SF): result < 0 ↔ top bit set */
         case CC_S:
-            if (cs->cmp_mode == 2 || cs->cmp_mode == 3) emit_bltz(&bp, zreg, br_off & 0xFFF);
+            if (cs->cmp_mode == 2 || cs->cmp_mode == 3) emit_bltz(&bp, zreg, skip_j_off & 0xFFF);
             else                                        return false;
             break;
         case CC_NS:
-            if (cs->cmp_mode == 2 || cs->cmp_mode == 3) emit_bgez(&bp, zreg, br_off & 0xFFF);
+            if (cs->cmp_mode == 2 || cs->cmp_mode == 3) emit_bgez(&bp, zreg, skip_j_off & 0xFFF);
             else                                        return false;
             break;
         default: return false;
         }
+        EmitPtr jp = j_site;
+        emit_j_target(&jp, taken_start);
         cs->cmp_mode = 0;
         break;
     }
@@ -1604,21 +1703,12 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_SHx_RI)
         return true;
-    /*
-     * Keep the expanded level-2 instruction set disabled for now.  Enabling
-     * the rest of ALU/CMP/TEST/NEG/Jcc still WDTs during SeaBIOS relocation on
-     * ESP32-S3.  The likely issue is a remaining interpreter/JIT state
-     * mismatch around lazy flags or block-boundary control flow, so fall back
-     * to the known-safe level-2 whitelist above.
-     */
-    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CMP_RR)
-        return true; */
-    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CMP_RI)
-        return true; */
-    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_TEST_RR)
-        return true; */
-    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_JCC)
-        return true; */
+    if (TINY386_JIT_LEVEL >= 3 &&
+        (a->type == ACT_CMP_RR || a->type == ACT_CMP_RI ||
+         a->type == ACT_TEST_RR || a->type == ACT_JCC))
+        return true;
+    if (TINY386_JIT_LEVEL >= 3 && a->type == ACT_XCHG_EAX_R)
+        return true;
     return false;
 }
 
@@ -1670,12 +1760,46 @@ void jit_invalidate_all(JITState *jit)
     }
     jit->pool_used = 0;
     jit->pool_epoch++;
+    memset(jit->smc_page_bitmap, 0, sizeof(jit->smc_page_bitmap));
 }
 
-void jit_invalidate_page(JITState *jit, uint32_t paddr)
+static inline uint32_t jit_smc_page_bit(uint32_t paddr)
 {
-    uint32_t page_start = paddr & JIT_GUEST_PAGE_MASK;
-    uint32_t page_end   = page_start + JIT_GUEST_PAGE_SIZE;
+    return (paddr >> 12) & (JIT_SMC_PAGE_BITS - 1u);
+}
+
+static inline void jit_smc_mark_page(JITState *jit, uint32_t paddr)
+{
+    uint32_t bit = jit_smc_page_bit(paddr);
+    jit->smc_page_bitmap[bit >> 5] |= 1u << (bit & 31u);
+}
+
+static bool jit_smc_range_maybe_has_code(JITState *jit, uint32_t paddr, uint32_t size)
+{
+    uint32_t end = paddr + size - 1u;
+    uint32_t page = paddr & JIT_GUEST_PAGE_MASK;
+    uint32_t last_page = end & JIT_GUEST_PAGE_MASK;
+
+    for (;;) {
+        uint32_t bit = jit_smc_page_bit(page);
+        if (jit->smc_page_bitmap[bit >> 5] & (1u << (bit & 31u)))
+            return true;
+        if (page == last_page)
+            return false;
+        page += JIT_GUEST_PAGE_SIZE;
+    }
+}
+
+void jit_invalidate_range(JITState *jit, uint32_t paddr, uint32_t size)
+{
+    uint32_t range_end = paddr + size;
+
+    if (size == 0)
+        return;
+    if (range_end < paddr)
+        range_end = UINT32_MAX;
+    if (!jit_smc_range_maybe_has_code(jit, paddr, size))
+        return;
 
     jit->smc_flushes++;
 
@@ -1684,11 +1808,17 @@ void jit_invalidate_page(JITState *jit, uint32_t paddr)
         if (block->status != JIT_VALID)
             continue;
 
-        if (block->guest_paddr < page_end && block->guest_end > page_start) {
+        if (block->guest_paddr < range_end && block->guest_end > paddr) {
             block->status = JIT_EMPTY;
             jit->invalidations++;
         }
     }
+}
+
+void jit_invalidate_page(JITState *jit, uint32_t paddr)
+{
+    uint32_t page_start = paddr & JIT_GUEST_PAGE_MASK;
+    jit_invalidate_range(jit, page_start, JIT_GUEST_PAGE_SIZE);
 }
 
 IRAM_ATTR
@@ -1776,9 +1906,6 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     uint8_t  *code_start = tmp_code;
     uint8_t  *code_end   = tmp_code + JIT_BLOCK_MAXBYTES;
     EmitPtr   p          = tmp_code;
-
-    /* Emit prologue: load x86 GPRs into LX7 registers */
-    emit_prologue(&p, LX7_CPU_REG);
 
     /* Pass 1: Scan and decode all instructions in the block */
     X86Action *actions = s_jit_scan_actions;
@@ -1871,6 +1998,8 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     }
 
     /* Pass 2: Translate and emit Xtensa instructions */
+    uint8_t  load_mask = 0;
+    uint8_t  store_mask = 0;
     CmpState cs   = {0};
     int      emitted_bytes = 0;
     int      emitted_insns = 0;
@@ -1878,12 +2007,15 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     uint16_t block_flags = JIT_BLOCKF_NONE;
     bool     ended_block = false;
     cur_eip = eip;
+    jit_actions_reg_masks(actions, insn_count, &load_mask, &store_mask);
+    emit_prologue(&p, LX7_CPU_REG, load_mask);
 
     for (int n = 0; n < insn_count; n++) {
         X86Action *a = &actions[n];
         int bytes = action_bytes[n];
 
-        ok = emit_action(&p, code_end, a, &cs, cur_eip + bytes, LX7_CPU_REG);
+        ok = emit_action(&p, code_end, a, &cs, cur_eip + bytes, LX7_CPU_REG,
+                         store_mask);
         if (!ok) break;
         JIT_TRACEF("[jit_trace] emit #%d action=%s x86_eip=0x%08x "
                    "next=0x%08x host_used=%u\n",
@@ -1897,7 +2029,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         ended_block    = jit_action_ends_block(a);
 
 #if TINY386_JIT_SINGLE_INSN_BLOCK
-        emit_epilogue(&p, LX7_CPU_REG, cur_eip);
+        emit_epilogue(&p, LX7_CPU_REG, cur_eip, store_mask);
         ended_block = true;
         break;
 #endif
@@ -1905,7 +2037,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
     if (ok && !ended_block) {
         if (p + 80 < code_end)
-            emit_epilogue(&p, LX7_CPU_REG, cur_eip);
+            emit_epilogue(&p, LX7_CPU_REG, cur_eip, store_mask);
         else
             ok = false;
     }
@@ -1918,7 +2050,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         }
         /* Partial: emit epilogue */
         if (p + 80 < code_end) {
-            emit_epilogue(&p, LX7_CPU_REG, cur_eip);
+            emit_epilogue(&p, LX7_CPU_REG, cur_eip, store_mask);
             block_flags |= JIT_BLOCKF_PARTIAL;
         } else {
             jit_mark_nojit(block, paddr, paddr + (uint32_t)emitted_bytes,
@@ -1940,6 +2072,9 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     block->exit_kind    = jit_exit_kind_for_actions(actions, emitted_insns);
     block->bail         = JIT_BAIL_NONE;
     block->status       = JIT_VALID;
+    jit_smc_mark_page(jit, block->guest_paddr);
+    if ((block->guest_end - 1u) > (block->guest_paddr | (JIT_GUEST_PAGE_SIZE - 1u)))
+        jit_smc_mark_page(jit, block->guest_end - 1u);
 
     jit_commit_code(pool_write, code_start, block->host_len);
     jit->pool_used += jit_align4(block->host_len);

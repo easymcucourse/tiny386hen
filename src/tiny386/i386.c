@@ -138,6 +138,15 @@ struct CPUI386 {
 #define THROW(ex, err) do { cpu->excno = (ex); cpu->excerr = (err); return false; } while(0)
 #define THROW0(ex) do { cpu->excno = (ex); return false; } while(0)
 
+static inline void jit_state_change_invalidate(CPUI386 *cpu)
+{
+#if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
+	jit_invalidate_all(&cpu->jit);
+#else
+	(void)cpu;
+#endif
+}
+
 // the second branchless version works better on gcc
 //#define SET_BIT(w, f, m) ((w) ^= ((-(uword)(f)) ^ (w)) & (m))
 #define SET_BIT(w, f, m) ((w) = ((w) & ~((uword)(m))) | ((-(uword)(f)) & (m)))
@@ -824,6 +833,17 @@ static inline bool in_iomem(uword addr)
 	return (addr >= 0xa0000 && addr < 0xc0000) || addr >= 0xe0000000;
 }
 
+static inline void jit_store_invalidate(CPUI386 *cpu, uword addr, uint32_t size)
+{
+#if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
+	jit_invalidate_range(&cpu->jit, (uint32_t)addr, size);
+#else
+	(void)cpu;
+	(void)addr;
+	(void)size;
+#endif
+}
+
 static u8 IRAM_ATTR load8(CPUI386 *cpu, OptAddr *res)
 {
 	uword addr = res->addr1;
@@ -883,6 +903,7 @@ static void IRAM_ATTR store8(CPUI386 *cpu, OptAddr *res, u8 val)
 		return;
 	}
 	pstore8(cpu, addr, val);
+	jit_store_invalidate(cpu, addr, 1);
 }
 
 static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
@@ -896,9 +917,12 @@ static void IRAM_ATTR store16(CPUI386 *cpu, OptAddr *res, u16 val)
 	}
 	if (likely(res->res == ADDR_OK1)) {
 		pstore16(cpu, res->addr1, val);
+		jit_store_invalidate(cpu, res->addr1, 2);
 	} else {
 		pstore8(cpu, res->addr1, val);
+		jit_store_invalidate(cpu, res->addr1, 1);
 		pstore8(cpu, res->addr2, val >> 8);
+		jit_store_invalidate(cpu, res->addr2, 1);
 	}
 }
 
@@ -913,21 +937,30 @@ static void IRAM_ATTR store32(CPUI386 *cpu, OptAddr *res, u32 val)
 	}
 	if (likely(res->res == ADDR_OK1)) {
 		pstore32(cpu, res->addr1, val);
+		jit_store_invalidate(cpu, res->addr1, 4);
 	} else {
 		switch(res->addr1 & 0xf) {
 		case 0xf:
 			pstore8(cpu, res->addr1, val);
+			jit_store_invalidate(cpu, res->addr1, 1);
 			pstore16(cpu, res->addr2, val >> 8);
+			jit_store_invalidate(cpu, res->addr2, 2);
 			pstore8(cpu, res->addr2 + 2, val >> 24);
+			jit_store_invalidate(cpu, res->addr2 + 2, 1);
 			break;
 		case 0xe:
 			pstore16(cpu, res->addr1, val);
+			jit_store_invalidate(cpu, res->addr1, 2);
 			pstore16(cpu, res->addr2, val >> 16);
+			jit_store_invalidate(cpu, res->addr2, 2);
 			break;
 		case 0xd:
 			pstore8(cpu, res->addr1, val);
+			jit_store_invalidate(cpu, res->addr1, 1);
 			pstore16(cpu, res->addr1 + 1, val >> 8);
+			jit_store_invalidate(cpu, res->addr1 + 1, 2);
 			pstore8(cpu, res->addr2, val >> 24);
+			jit_store_invalidate(cpu, res->addr2, 1);
 			break;
 		}
 	}
@@ -1174,6 +1207,7 @@ static bool read_desc(CPUI386 *cpu, int sel, uword *w1, uword *w2)
 
 static bool set_seg(CPUI386 *cpu, int seg, int sel)
 {
+	bool old_code16 = cpu->code16;
 	sel = sel & 0xffff;
 	if (!(cpu->cr0 & 1) || (cpu->flags & VM)) {
 		cpu->seg[seg].sel = sel;
@@ -1183,6 +1217,8 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 		if (seg == SEG_CS) {
 			cpu->cpl = cpu->flags & VM ? 3 : 0;
 			cpu->code16 = true;
+			if (cpu->code16 != old_code16)
+				jit_state_change_invalidate(cpu);
 		}
 		if (seg == SEG_SS) {
 			cpu->sp_mask = 0xffff;
@@ -1219,6 +1255,8 @@ static bool set_seg(CPUI386 *cpu, int seg, int sel)
 //			dolog("set_seg: PVL %d => %d\n", cpu->cpl, sel & 3);
 		cpu->cpl = sel & 3;
 		cpu->code16 = !(cpu->seg[SEG_CS].flags & SEG_D_BIT);
+		if (cpu->code16 != old_code16)
+			jit_state_change_invalidate(cpu);
 	}
 	if (seg == SEG_SS) {
 		cpu->sp_mask = cpu->seg[SEG_SS].flags & SEG_B_BIT ? 0xffffffff : 0xffff;
@@ -2348,8 +2386,10 @@ noinline void IRAM_ATTR try_jcc8(CPUI386 *cpu)
 	int rm = modrm & 7; \
 	if (reg == 0) { \
 		u32 new_cr0 = lreg32(rm); \
-		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) \
+		if ((new_cr0 ^ cpu->cr0) & (CR0_PG | CR0_WP | 1)) { \
 			tlb_clear(cpu); \
+			jit_state_change_invalidate(cpu); \
+		} \
 		if (cpu->fpu) new_cr0 |= 0x10; \
 		cpu->cr0 = new_cr0; \
 	} else if (reg == 2) { \
@@ -2357,6 +2397,7 @@ noinline void IRAM_ATTR try_jcc8(CPUI386 *cpu)
 	} else if (reg == 3) { \
 		cpu->cr3 = lreg32(rm); \
 		tlb_clear(cpu); \
+		jit_state_change_invalidate(cpu); \
 	} else if (reg == 4) { \
 	} else THROW0(EX_UD);
 
@@ -4385,6 +4426,7 @@ static bool task_switch(CPUI386 *cpu, int tss, int sw_type)
 	TRY1(translate(cpu, &meml, 1, SEG_TR, 0x1c, 4, 0));
 	cpu->cr3 = load32(cpu, &meml);
 	tlb_clear(cpu);
+	jit_state_change_invalidate(cpu);
 
 	return true;
 }
@@ -5583,6 +5625,26 @@ void jit_cpu_prepare_exec(CPUI386 *cpu, uint32_t ip)
 void jit_cpu_invalidate_cache(CPUI386 *cpu)
 {
 	jit_invalidate_all(&cpu->jit);
+}
+
+uint32_t jit_selftest_get_pool_epoch(CPUI386 *cpu)
+{
+	return cpu->jit.pool_epoch;
+}
+
+void jit_selftest_force_pool_used(CPUI386 *cpu, uint32_t pool_used)
+{
+	cpu->jit.pool_used = pool_used;
+}
+
+uint32_t jit_selftest_get_invalidations(CPUI386 *cpu)
+{
+	return cpu->jit.invalidations;
+}
+
+uint32_t jit_selftest_get_smc_flushes(CPUI386 *cpu)
+{
+	return cpu->jit.smc_flushes;
 }
 
 _Static_assert(offsetof(struct CPUI386, gprx[0].r32) == 0,  "GPR_OFF(0) mismatch: gprx[0] not at offset 0");

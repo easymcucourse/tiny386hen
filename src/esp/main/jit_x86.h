@@ -61,6 +61,8 @@ typedef struct FPU FPU;
 /* Guest page granularity used for future self-modifying-code tracking. */
 #define JIT_GUEST_PAGE_SIZE 4096u
 #define JIT_GUEST_PAGE_MASK (~(JIT_GUEST_PAGE_SIZE - 1u))
+#define JIT_SMC_PAGE_BITS   1024u
+#define JIT_SMC_PAGE_WORDS  (JIT_SMC_PAGE_BITS / 32u)
 
 /*
  * Maximum guest byte range recorded for one translated block.
@@ -262,6 +264,7 @@ typedef struct {
     uint32_t bailed;        /* Blocks that could not be compiled. */
     uint32_t invalidations; /* Cache entries dropped by SMC/reset. */
     uint32_t smc_flushes;   /* Page/range invalidations requested. */
+    uint32_t smc_page_bitmap[JIT_SMC_PAGE_WORDS]; /* Hashed pages with translated code. */
     uint32_t bail_counts[JIT_BAIL_POOL_FULL + 1u];
     uint32_t stats_ticks;   /* Attempts since last periodic stats dump. */
 } JITState;
@@ -298,6 +301,11 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu);
  * jit_invalidate_all() - flush the entire cache.
  */
 void jit_invalidate_all(JITState *jit);
+
+/**
+ * jit_invalidate_range() - flush blocks overlapping a physical byte range.
+ */
+void jit_invalidate_range(JITState *jit, uint32_t paddr, uint32_t size);
 
 /**
  * jit_invalidate_page() - flush blocks associated with one physical page.
