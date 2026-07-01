@@ -13,9 +13,9 @@
  *    byte[2] = bits[23:16]
  *
  *  RRR format  (ADD, SUB, AND, OR, XOR, NEG, SLL, SRL, SRA, SSL, SSR)
- *    byte[2] = (op2 << 4) | r          r  = destination
- *    byte[1] = (s   << 4) | t          s  = source-1, t = source-2
- *    byte[0] = (op1 << 4) | op0        op0 = 0, op1 = 0 for ALU
+ *    byte[2] = (t   << 4) | op1        t  = source-2, op1 = 0 for ALU
+ *    byte[1] = (r   << 4) | s          r  = destination, s = source-1
+ *    byte[0] = (op2 << 4) | op0        op0 = 0
  *
  *  RRI8 format (ADDI, L32I, S32I, BEQ, BNE, BLT, BGE, BLTU, BGEU)
  *    byte[2] = imm8
@@ -57,6 +57,12 @@
 #include "esp_mmu_map.h"
 #include "esp_rom_sys.h"
 #include "hal/mmu_types.h"
+
+#if TINY386_JIT_TRACE
+#define JIT_TRACEF(...) esp_rom_printf(__VA_ARGS__)
+#else
+#define JIT_TRACEF(...) do { } while (0)
+#endif
 
 static uint8_t *s_jit_pool_write;
 static uint8_t *s_jit_pool_exec;
@@ -146,7 +152,11 @@ bool jit_pool_ready(void)
  * block kinds explicit and independently disableable while a backend matures.
  */
 #ifndef TINY386_JIT_ENABLE_MOV_RR
-#define TINY386_JIT_ENABLE_MOV_RR 0
+#define TINY386_JIT_ENABLE_MOV_RR 1
+#endif
+
+#ifndef TINY386_JIT_ENABLE_MOV_RI
+#define TINY386_JIT_ENABLE_MOV_RI 1
 #endif
 
 #ifndef TINY386_JIT_ENABLE_JMP
@@ -193,9 +203,9 @@ typedef uint8_t *EmitPtr;
 
 static inline void emit_rrr(EmitPtr *p, int op2, int op1, int r, int s, int t)
 {
-    (*p)[0] = (uint8_t)((op1 << 4) | 0x00 /* op0=0 */);
-    (*p)[1] = (uint8_t)((s   << 4) | t);
-    (*p)[2] = (uint8_t)((op2 << 4) | r);
+    (*p)[0] = (uint8_t)((t   << 4) | 0x00 /* op0=0 */);
+    (*p)[1] = (uint8_t)((r   << 4) | s);
+    (*p)[2] = (uint8_t)((op2 << 4) | op1);
     *p += 3;
 }
 
@@ -223,10 +233,12 @@ static inline void emit_xor(EmitPtr *p, int r, int s, int t)
 static inline void emit_neg(EmitPtr *p, int r, int t)
 { emit_rrr(p, LX7_OP2_NEG, 0, r, /*s=*/0, t); }
 
-/* MOV ar, as  (implemented as OR ar, as, as) */
+/* MOV.N ar, as.  The 3-byte OR alias is legal in objdump but traps on board. */
 static inline void emit_mov(EmitPtr *p, int r, int s)
 {
-    emit_or(p, r, s, s);
+    (*p)[0] = (uint8_t)((r << 4) | 0x0d);
+    (*p)[1] = (uint8_t)s;
+    *p += 2;
 }
 
 /* SSL as  — load SAR = (32 - as) for left shifts */
@@ -377,9 +389,9 @@ static inline void emit_bgez(EmitPtr *p, int s, int imm12)
 /* ---- RI format: MOVI at, simm12 ---------------------------------- */
 static inline void emit_movi(EmitPtr *p, int t, int imm12)
 {
-    (*p)[0] = 0xA2;
-    (*p)[1] = (uint8_t)(((imm12 & 0xF) << 4) | t);
-    (*p)[2] = (uint8_t)((imm12 >> 4) & 0xFF);
+    (*p)[0] = (uint8_t)((t << 4) | 0x2);
+    (*p)[1] = (uint8_t)(0xA0 | ((imm12 >> 8) & 0xF));
+    (*p)[2] = (uint8_t)(imm12 & 0xFF);
     *p += 3;
 }
 
@@ -625,6 +637,35 @@ typedef struct {
 
 static X86Action s_jit_scan_actions[JIT_SCAN_LIMIT];
 static uint8_t   s_jit_scan_action_bytes[JIT_SCAN_LIMIT];
+
+static const char *jit_action_name(ActionType type)
+{
+    switch (type) {
+    case ACT_NONE:        return "NONE";
+    case ACT_NOP:         return "NOP";
+    case ACT_MOV_RR:      return "MOV_RR";
+    case ACT_MOV_RI:      return "MOV_RI";
+    case ACT_ALU_RR:      return "ALU_RR";
+    case ACT_ALU_RI:      return "ALU_RI";
+    case ACT_NOT_R:       return "NOT_R";
+    case ACT_NEG_R:       return "NEG_R";
+    case ACT_INC_R:       return "INC_R";
+    case ACT_DEC_R:       return "DEC_R";
+    case ACT_SHx_RI:      return "SHx_RI";
+    case ACT_SHx_CL:      return "SHx_CL";
+    case ACT_CMP_RR:      return "CMP_RR";
+    case ACT_CMP_RI:      return "CMP_RI";
+    case ACT_TEST_RR:     return "TEST_RR";
+    case ACT_JMP:         return "JMP";
+    case ACT_JCC:         return "JCC";
+    case ACT_CWDE:        return "CWDE";
+    case ACT_CDQ:         return "CDQ";
+    case ACT_XCHG_EAX_R:  return "XCHG_EAX_R";
+    case ACT_BSWAP_R:     return "BSWAP_R";
+    case ACT_BLOCK_END:   return "BLOCK_END";
+    default:              return "?";
+    }
+}
 
 /*
  * Decode one x86 instruction (32-bit mode, register operands only).
@@ -952,7 +993,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
          * stable 3-byte OR-based move for controlled experiments until the
          * state mismatch is found with translation/execution tracing.
          */
-        GUARD(3); emit_mov(p, dr, sr); break;
+        GUARD(2); emit_mov(p, dr, sr); break;
 
     case ACT_MOV_RI:
         GUARD(16); emit_movi32(p, dr, (uint32_t)a->imm); break;
@@ -972,7 +1013,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         }
 
         if (!fd) {
-            GUARD(24);
+            GUARD(40);
             emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
             emit_s32i(p, sr, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
             switch (a->alu_op) {
@@ -986,7 +1027,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
             emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
             emit_movi(p, t0, cc_op);
             emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
-            emit_movi(p, t0, cc_mask);
+            emit_movi32(p, t0, (uint32_t)cc_mask);
             emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
         } else {
             GUARD(3);
@@ -1032,7 +1073,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
             emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
             emit_movi(p, t0, cc_op);
             emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
-            emit_movi(p, t0, cc_mask);
+            emit_movi32(p, t0, (uint32_t)cc_mask);
             emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
         } else {
             if (a->alu_op == ALU_ADD && imm >= -128 && imm <= 127) {
@@ -1066,13 +1107,13 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     case ACT_NEG_R: {
         bool fd = a->flags_dead;
         if (!fd) {
-            GUARD(24);
+            GUARD(40);
             emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
             emit_neg(p, dr, dr);
             emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
             emit_movi(p, t0, JIT_CC_NEG32);
             emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
-            emit_movi(p, t0, JIT_CC_MASK_ARITH);
+            emit_movi32(p, t0, JIT_CC_MASK_ARITH);
             emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
         } else {
             GUARD(3); emit_neg(p, dr, dr);
@@ -1129,14 +1170,14 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
         bool fd = a->flags_dead;
         if (!fd) {
-            GUARD(24);
+            GUARD(40);
             emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
             emit_s32i(p, sr, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
             emit_sub(p, t0, dr, sr);
             emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
             emit_movi(p, t2, JIT_CC_SUB);
             emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
-            emit_movi(p, t2, JIT_CC_MASK_ARITH);
+            emit_movi32(p, t2, JIT_CC_MASK_ARITH);
             emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
         }
         break;
@@ -1145,7 +1186,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     case ACT_CMP_RI: {
         /* Compute (dr - imm) into TMP0 for the subsequent branch and cc.dst */
         bool fd = a->flags_dead;
-        GUARD(16 + 3 + (fd ? 0 : 24));
+        GUARD(16 + 3 + (fd ? 0 : 40));
         emit_movi32(p, t1, (uint32_t)a->imm);
         emit_sub(p, t0, dr, t1);
         cs->cmp_mode  = 2;
@@ -1159,7 +1200,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
             emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
             emit_movi(p, t2, JIT_CC_SUB);
             emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
-            emit_movi(p, t2, JIT_CC_MASK_ARITH);
+            emit_movi32(p, t2, JIT_CC_MASK_ARITH);
             emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
         }
         break;
@@ -1168,7 +1209,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     case ACT_TEST_RR: {
         /* Compute (dr & sr) into TMP0 for BEQZ/BNEZ */
         bool fd = a->flags_dead;
-        GUARD(3 + (fd ? 0 : 15));
+        GUARD(3 + (fd ? 0 : 32));
         emit_and(p, t0, dr, sr);
         cs->cmp_mode  = 3;
         cs->cmp_lreg  = t0;
@@ -1177,7 +1218,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
             emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
             emit_movi(p, t1, JIT_CC_AND);
             emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
-            emit_movi(p, t1, JIT_CC_MASK_LOGIC);
+            emit_movi32(p, t1, JIT_CC_MASK_LOGIC);
             emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
         }
         break;
@@ -1329,6 +1370,61 @@ static void jit_mark_nojit(JITBlock *block, uint32_t paddr, uint32_t guest_end,
     block->status      = JIT_NOJIT;
 }
 
+static const char *jit_bail_reason_name(JITBailReason reason)
+{
+    switch (reason) {
+    case JIT_BAIL_NONE:               return "none";
+    case JIT_BAIL_DISABLED:           return "disabled";
+    case JIT_BAIL_CODE16:             return "code16";
+    case JIT_BAIL_PAGING:             return "paging";
+    case JIT_BAIL_OUT_OF_GUEST_MEM:   return "out_of_guest_mem";
+    case JIT_BAIL_UNSUPPORTED_PREFIX: return "unsupported_prefix";
+    case JIT_BAIL_UNSUPPORTED_OPCODE: return "unsupported_opcode";
+    case JIT_BAIL_MEMORY_OPERAND:     return "memory_operand";
+    case JIT_BAIL_FLAGS_UNSAFE:       return "flags_unsafe";
+    case JIT_BAIL_HOST_BUFFER_FULL:   return "host_buffer_full";
+    case JIT_BAIL_POOL_FULL:          return "pool_full";
+    default:                          return "?";
+    }
+}
+
+static void jit_count_bail(JITState *jit, JITBailReason reason)
+{
+    jit->bailed++;
+    if ((unsigned)reason <= JIT_BAIL_POOL_FULL)
+        jit->bail_counts[reason]++;
+}
+
+static void jit_dump_stats(const JITState *jit)
+{
+    esp_rom_printf("[jit_stats] hits=%u misses=%u bailed=%u invalidations=%u "
+                   "smc=%u pool=%u/%u epoch=%u\n",
+                   (unsigned)jit->hits, (unsigned)jit->misses,
+                   (unsigned)jit->bailed, (unsigned)jit->invalidations,
+                   (unsigned)jit->smc_flushes, (unsigned)jit->pool_used,
+                   (unsigned)JIT_POOL_SIZE, (unsigned)jit->pool_epoch);
+    for (unsigned i = 1; i <= JIT_BAIL_POOL_FULL; i++) {
+        if (jit->bail_counts[i] != 0) {
+            esp_rom_printf("[jit_stats] bail %-20s %u\n",
+                           jit_bail_reason_name((JITBailReason)i),
+                           (unsigned)jit->bail_counts[i]);
+        }
+    }
+}
+
+static void jit_maybe_dump_stats(JITState *jit)
+{
+#if TINY386_JIT_STATS_PERIOD > 0
+    jit->stats_ticks++;
+    if (jit->stats_ticks >= (uint32_t)TINY386_JIT_STATS_PERIOD) {
+        jit->stats_ticks = 0;
+        jit_dump_stats(jit);
+    }
+#else
+    (void)jit;
+#endif
+}
+
 static uint16_t jit_block_flags_for_actions(const X86Action *actions, int count)
 {
     if (count <= 0)
@@ -1387,14 +1483,14 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
      *     basic prologue/epilogue, code commit, and next_ip advance can work.
      *
      *   ACT_MOV_RI:
-     *     Earlier level1 tests were stable, but it has not been re-tested after
-     *     the later entry/retw, PSRAM pool, and emitter changes. Re-test as a
-     *     single enabled action before treating it as a baseline.
+     *     Re-tested after the entry/retw, PSRAM pool, and emitter changes.
+     *     Task 1.2 mixed handoff cases pass, so Task 1.3 admits it as a
+     *     single-instruction block baseline.
      *
      *   ACT_MOV_RR:
-     *     Failed in level2 and MOV_RR-only tests with WDT after the SeaBIOS
-     *     PCI/MPTABLE area. The emitter now uses the stable 3-byte OR-based
-     *     move path, so this still needs execution tracing/state comparison.
+     *     Failed with the old 3-byte OR alias path, which trapped on board as
+     *     IllegalInstruction. Task 1.4 switched MOV_RR to density MOV.N and
+     *     the board differential selftest now passes.
      *
      *   ACT_JMP:
      *     Failed in JMP-only tests, usually during "Relocating init ...".
@@ -1420,6 +1516,9 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
         return false;
     if (TINY386_JIT_LEVEL >= 1 && a->type == ACT_NOP)
         return true;
+    if (TINY386_JIT_LEVEL >= 1 && TINY386_JIT_ENABLE_MOV_RI &&
+        a->type == ACT_MOV_RI)
+        return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NOT_R)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CWDE)
@@ -1428,25 +1527,25 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_BSWAP_R)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 && TINY386_JIT_ENABLE_MOV_RR &&
+    if (TINY386_JIT_LEVEL >= 1 && TINY386_JIT_ENABLE_MOV_RR &&
         a->type == ACT_MOV_RR)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && TINY386_JIT_ENABLE_JMP &&
         a->type == ACT_JMP)
         return true;
+    if (TINY386_JIT_LEVEL >= 2 &&
+        (a->type == ACT_ALU_RR || a->type == ACT_ALU_RI) &&
+        (a->alu_op == ALU_ADD || a->alu_op == ALU_SUB ||
+         a->alu_op == ALU_AND || a->alu_op == ALU_OR ||
+         a->alu_op == ALU_XOR))
+        return true;
     /*
      * Keep the expanded level-2 instruction set disabled for now.  Enabling
-     * MOV_RI/ALU/CMP/TEST/NEG/Jcc still WDTs during SeaBIOS relocation on
+     * the rest of ALU/CMP/TEST/NEG/Jcc still WDTs during SeaBIOS relocation on
      * ESP32-S3.  The likely issue is a remaining interpreter/JIT state
      * mismatch around lazy flags or block-boundary control flow, so fall back
      * to the known-safe level-2 whitelist above.
      */
-    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_MOV_RI)
-        return true; */
-    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_ALU_RR)
-        return true; */
-    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_ALU_RI)
-        return true; */
     /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NEG_R)
         return true; */
     /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CMP_RR)
@@ -1534,8 +1633,10 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 {
     if (!jit->pool)
         return NULL;
-    if (cpui386_is_code16(cpu))
+    if (cpui386_is_code16(cpu)) {
+        jit_count_bail(jit, JIT_BAIL_CODE16);
         return NULL;
+    }
 
     /* Get physical address of current instruction */
     uint32_t cs_base  = cpui386_get_cs_base(cpu);
@@ -1549,22 +1650,31 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     if (cr0 & 0x80000000u) {
         /* Paging enabled: quick check — if laddr < phys_mem_size treat
          * as identity-mapped (common for Win9x < 4GB flat model).      */
-        if (laddr >= phys_mem_size)
+        if (laddr >= phys_mem_size) {
+            jit_count_bail(jit, JIT_BAIL_PAGING);
             return NULL;
+        }
     }
 
     uint32_t paddr = laddr;
+    JIT_TRACEF("[jit_trace] translate begin eip=0x%08x cs=0x%08x "
+               "paddr=0x%08x cr0=0x%08x\n",
+               (unsigned)eip, (unsigned)cs_base, (unsigned)paddr,
+               (unsigned)cr0);
 
     /* Allocate or find cache slot */
     uint32_t  slot  = jit_hash(paddr);
     JITBlock *block = &jit->blocks[slot];
 
-    if (block->status == JIT_NOJIT && block->guest_paddr == paddr)
+    if (block->status == JIT_NOJIT && block->guest_paddr == paddr) {
+        JIT_TRACEF("[jit_trace] sticky-nojit paddr=0x%08x bail=%s\n",
+                   (unsigned)paddr, jit_bail_reason_name(block->bail));
         return NULL; /* previously deemed un-translatable */
+    }
 
     if (paddr >= phys_mem_size) {
         jit_mark_nojit(block, paddr, paddr, JIT_BAIL_OUT_OF_GUEST_MEM);
-        jit->bailed++;
+        jit_count_bail(jit, JIT_BAIL_OUT_OF_GUEST_MEM);
         return NULL;
     }
 
@@ -1638,6 +1748,11 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         if (bytes == 0) {
             break;
         }
+        JIT_TRACEF("[jit_trace] scan #%d eip=0x%08x bytes=%d action=%s "
+                   "dst=%d src=%d imm=0x%08x target=0x%08x\n",
+                   n, (unsigned)cur_eip, bytes, jit_action_name(a->type),
+                   a->dst, a->src, (unsigned)a->imm,
+                   (unsigned)a->target_eip);
         action_bytes[n] = bytes;
         x86_consumed += bytes;
         cur_eip      += bytes;
@@ -1657,7 +1772,9 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
     if (insn_count == 0) {
         jit_mark_nojit(block, paddr, paddr, scan_bail);
-        jit->bailed++;
+        jit_count_bail(jit, scan_bail);
+        JIT_TRACEF("[jit_trace] translate bail paddr=0x%08x reason=%s\n",
+                   (unsigned)paddr, jit_bail_reason_name(scan_bail));
         return NULL;
     }
 
@@ -1705,6 +1822,11 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
         ok = emit_action(&p, code_end, a, &cs, cur_eip + bytes, LX7_CPU_REG);
         if (!ok) break;
+        JIT_TRACEF("[jit_trace] emit #%d action=%s x86_eip=0x%08x "
+                   "next=0x%08x host_used=%u\n",
+                   n, jit_action_name(a->type), (unsigned)cur_eip,
+                   (unsigned)(cur_eip + (uint32_t)bytes),
+                   (unsigned)(p - code_start));
 
         emitted_bytes += bytes;
         emitted_insns++;
@@ -1728,7 +1850,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     if (!ok || p >= code_end) {
         if (emitted_bytes == 0) {
             jit_mark_nojit(block, paddr, paddr, JIT_BAIL_HOST_BUFFER_FULL);
-            jit->bailed++;
+            jit_count_bail(jit, JIT_BAIL_HOST_BUFFER_FULL);
             return NULL;
         }
         /* Partial: emit epilogue */
@@ -1738,7 +1860,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         } else {
             jit_mark_nojit(block, paddr, paddr + (uint32_t)emitted_bytes,
                            JIT_BAIL_HOST_BUFFER_FULL);
-            jit->bailed++;
+            jit_count_bail(jit, JIT_BAIL_HOST_BUFFER_FULL);
             return NULL;
         }
     }
@@ -1758,6 +1880,12 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
     jit_commit_code(pool_write, code_start, block->host_len);
     jit->pool_used += jit_align4(block->host_len);
+    JIT_TRACEF("[jit_trace] translate ok paddr=0x%08x guest_end=0x%08x "
+               "insns=%u x86_len=%u host=%p host_len=%u flags=0x%x exit=%u\n",
+               (unsigned)block->guest_paddr, (unsigned)block->guest_end,
+               (unsigned)block->x86_insns, (unsigned)block->x86_len,
+               (void *)block->host_code, (unsigned)block->host_len,
+               (unsigned)block->flags, (unsigned)block->exit_kind);
 
     return block;
 }
@@ -1768,27 +1896,39 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         return 0;
 
     uint32_t cs_base = cpui386_get_cs_base(cpu);
-    uint32_t laddr   = cs_base + cpui386_get_next_ip(cpu);
+    uint32_t eip     = cpui386_get_next_ip(cpu);
+    uint32_t laddr   = cs_base + eip;
     uint32_t cr0 = cpui386_get_cr0(cpu);
     if (cr0 & 0x80000000u) {
         if (laddr >= (uint32_t)cpui386_get_phys_mem_size(cpu))
             return 0;
     }
     uint32_t paddr = laddr;
+    JIT_TRACEF("[jit_trace] try eip=0x%08x paddr=0x%08x cr0=0x%08x\n",
+               (unsigned)eip, (unsigned)paddr, (unsigned)cr0);
 
     uint32_t  slot  = jit_hash(paddr);
     JITBlock *block = &jit->blocks[slot];
 
     if (block->status == JIT_NOJIT && block->guest_paddr == paddr) {
         jit->misses++;
+        JIT_TRACEF("[jit_trace] nojit-hit paddr=0x%08x bail=%s\n",
+                   (unsigned)paddr, jit_bail_reason_name(block->bail));
+        jit_maybe_dump_stats(jit);
         return 0;
     }
 
     if (block->status != JIT_VALID || block->guest_paddr != paddr) {
         /* Cache miss: translate */
+        JIT_TRACEF("[jit_trace] miss slot=%u status=%u old_paddr=0x%08x\n",
+                   (unsigned)slot, (unsigned)block->status,
+                   (unsigned)block->guest_paddr);
         block = jit_translate(jit, cpu);
         if (!block) {
             jit->misses++;
+            JIT_TRACEF("[jit_trace] miss-bail eip=0x%08x paddr=0x%08x\n",
+                       (unsigned)eip, (unsigned)paddr);
+            jit_maybe_dump_stats(jit);
             return 0;
         }
     }
@@ -1801,6 +1941,12 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         esp_rom_printf("[jit] exec @%p cpu=%p\n",
                        (void *)fn, (void *)cpu);
     }
+    JIT_TRACEF("[jit_trace] exec host=%p eip=0x%08x insns=%u x86_len=%u\n",
+               (void *)fn, (unsigned)eip, (unsigned)block->x86_insns,
+               (unsigned)block->x86_len);
     fn(cpu);
+    JIT_TRACEF("[jit_trace] done host=%p next_ip=0x%08x\n",
+               (void *)fn, (unsigned)cpui386_get_next_ip(cpu));
+    jit_maybe_dump_stats(jit);
     return block->x86_insns;
 }

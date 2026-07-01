@@ -482,12 +482,18 @@ JIT 头文件已经拆成两层：
 - **涉及文件**：`jit_lx7.c`；若 trace 开关需要跨后端共享，放入 `jit_x86.h`，LX7 私有开关放入 `jit_lx7.h`。
 - **Codex 提示词要点**：trace 默认关闭、零开销；打开后限频/限量避免刷屏拖垮 WDT。
 - **验收**：打开 trace 后能看到 NOP 块的翻译与执行日志，关闭后无任何额外开销。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。新增 `TINY386_JIT_TRACE`（默认 0）与 gated `JIT_TRACEF`，覆盖
+  `try`、cache miss、sticky NOJIT、scan action、emit action、translate ok/bail、exec/done。构建通过；默认关闭 trace 的
+  app 经 COM19 刷入后 selftest `4/4 PASS`。JTAG 验收因 USB-JTAG 未枚举连续失败 3 次跳过，改用 COM19 串口刷写完成。
 
 #### Task 0.5 — NOJIT/Bail 统计面板
 - **目标**：把 `JITState` 的 hits/misses/bailed/invalidations 以及各 `JITBailReason` 计数定期打印。
 - **范围(≈2h)**：新增按 bail 原因的计数数组；在自检/运行中周期性 dump。
 - **涉及文件**：`jit_x86.h`（通用统计字段/枚举），`jit_lx7.c`（当前 LX7 dump 实现）。
 - **验收**：运行后能看到"哪种原因导致最多次 NOJIT"，为后续放开优先级提供数据。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。`JITState` 增加 `bail_counts[]` 与 `stats_ticks`；
+  `jit_count_bail()` 统一统计 NOJIT/code16/paging 等失败原因；`jit_dump_stats()` 输出 hits/misses/bailed/
+  invalidations/smc/pool/epoch 和非零 bail 分布。CMake 增加 `TINY386_JIT_STATS_PERIOD` cache 变量，默认 2048。
 
 ---
 
@@ -618,11 +624,21 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **范围(≈2h)**：在自检中，块执行后再让解释器继续执行 N 条，验证不发散；检查 `cycle` 计数语义。
 - **涉及文件**：`jit_selftest.c`，必要时 `i386.c` 循环。
 - **验收**：MOV_RI 块 + 后续解释器混合执行，状态与全解释器一致。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。`JITCpuSnapshot` 扩展比较 `ip` 与 `cycle`；
+  新增 mixed 自检：`NOP -> MOV_RI` 与 `MOV_RI -> NOP -> MOV_RI`，路径为先 JIT 一条再解释器继续执行。
+  COM19 板上结果：`MIXED_NOP_THEN_MOV_EAX_mixed PASS`、`MIXED_MOV_EAX_NOP_MOV_EBX_mixed PASS`，
+  总结 `6/6 PASS`。主循环现有 `cpu->ip = cpu->next_ip; cpu->ifetch.paddr = 0` 交接路径验证通过。
 
 #### Task 1.3 — 放开 MOV_RI（单指令块）
 - **目标**：把 `ACT_MOV_RI` 纳入白名单并通过启动冒烟。
 - **范围(≈2h)**：`jit_action_enabled` 放开 MOV_RI；自检覆盖正负/大小立即数；启动冒烟。
 - **验收**：自检 PASS；SeaBIOS→DOS 启动无 WDT。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。`ACT_MOV_RI` 纳入 level 1 白名单，保留
+  `TINY386_JIT_ENABLE_MOV_RI` 保险开关；bring-up 初期曾使用 `TINY386_JIT_SINGLE_INSN_BLOCK=1` 隔离验证，
+  Task 1.5 已解除该限制。
+  同时修正 `TINY386_JIT_SELFTEST_ONLY` / `TINY386_JIT_SELFTEST_AT_BOOT` 的预处理判断，让宏值 0 真正关闭。
+  COM19 app-flash 成功；30 秒启动冒烟无 WDT/panic，SeaBIOS 完成 PCI/VGA 初始化，硬盘启动进入
+  `Booting from 0000:7c00`，随后到达 `set VGA mode 1`。
 
 #### Task 1.4 — 定位并修复 MOV_RR
 - **目标**：解决历史最顽固的 MOV_RR WDT。
@@ -630,11 +646,22 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **涉及文件**：`jit_lx7.c`（`emit_mov` 当前使用 3 字节 `OR rd,rs,rs` 稳态路径），`jit_selftest.c`。
 - **验收**：MOV_RR 自检 PASS；启动通过；记录根因到提交信息。
 - **备注**：历史 `mov.n` 字节对照表已删除；先用 `OR rd,rs,rs`（3 字节）稳态版本验证 MOV_RR 状态同步与块缓存/逐出交互。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。新增 MOV_RR 差分自检：
+  `MOV_EAX_EBX`（`89 d8`）与 `MOV_EDI_EAX`（`8b f8`）。旧 3 字节 `OR rd,rs,rs` 路径复现失败：
+  先表现为 GPR 不一致，修正 RRR 字段后在 `or a3,a6,a6` 处 `IllegalInstruction`。最终改用 Xtensa density
+  `MOV.N` 编码（如 `mov.n a3,a6 -> 3d 06`），MOV_RR 自检 `8/8 PASS`。运行时将
+  `TINY386_JIT_ENABLE_MOV_RR` 打开；COM19 正常启动冒烟 30 秒无 WDT/panic，SeaBIOS 到硬盘启动并到达
+  `set VGA mode 1`。
 
 #### Task 1.5 — 多指令直线块
 - **目标**：放开无分支直线块（MOV_RR/MOV_RI/XCHG/BSWAP/CWDE/CDQ 组合，`TINY386_JIT_LEVEL=2`）。
 - **范围(≈2h)**：去掉 `*_SINGLE_BLOCK` 限制（仅对已验证动作）；自检加多指令片段；启动冒烟。
 - **验收**：多指令片段自检 PASS；启动通过；命中率明显上升（看 P0.5 面板）。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成第一阶段。移除 ili9341 构建中的
+  `TINY386_JIT_SINGLE_INSN_BLOCK=1`，先对已验证的 `MOV_RI`/`MOV_RR`/`NOP` 放开多指令直线块；
+  新增 `BLOCK_MOV_CHAIN` 差分自检（`MOV EAX,imm32 -> MOV EBX,EAX -> NOP`），板上 selftest
+  `9/9 PASS`。切回正常启动后经 COM19 app-flash，30 秒启动冒烟无 WDT/panic，SeaBIOS 到硬盘启动并到达
+  `Booting from 0000:7c00` 与 `set VGA mode 1`。`XCHG/BSWAP/CWDE/CDQ` 仍保持后续 level 放开。
 
 ---
 
@@ -648,11 +675,24 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **范围(≈2h)**：自检对 ADD/SUB 遍历边界值（0、-1、INT_MAX、进位/溢出/借位组合），比较 6 个标志位。
 - **涉及文件**：`jit_selftest.c`，必要时修 `emit_action` 的 `cc` 写出。
 - **验收**：ADD/SUB 全标志自检 PASS 后放开这两类。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成板上差分自检与主程序回刷。新增 14 个
+  ADD/SUB 边界自检（RR/RI 覆盖 zero、carry/borrow、overflow、aux carry、negative imm），连同既有用例
+  selftest-only 结果 `23/23 PASS`。修复两处底层发射问题：RRR ALU 字段顺序改为 assembler 对照的
+  `t/op0, r/s, op2/op1` 布局；`MOVI` 3 字节编码修正，并将 `cc.mask` 的 `0x8d5/0x8c5`
+  改走 `emit_movi32` literal 路径。`jit_action_enabled()` 已在 `TINY386_JIT_LEVEL >= 2` 对
+  `ACT_ALU_RR/RI` 的 ADD/SUB 放开，其余 ALU/CMP/TEST/Jcc 仍保持关闭。切回正常主程序后 COM19
+  app-flash 成功，30 秒启动冒烟无 WDT/panic，到达 `Booting from 0000:7c00` 与 `set VGA mode 1`。
 
 #### Task 2.2 — AND/OR/XOR 逻辑标志
 - **目标**：逻辑运算 `cc.mask=LOGIC`、CF/OF=0、SF/ZF/PF 正确。
 - **范围(≈2h)**：自检遍历逻辑用例；放开 AND/OR/XOR。
 - **验收**：自检 PASS；启动通过。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。沿用 ALU 差分框架新增 12 个
+  AND/OR/XOR 边界用例（RR/RI 覆盖 zero、sign、parity），并把初始 EFLAGS 六个相关位全部置 1，
+  验证 CF/OF 清零、SF/ZF/PF 更新、AF 保留。`jit_action_enabled()` 已在
+  `TINY386_JIT_LEVEL >= 2` 对 `ACT_ALU_RR/RI` 的 AND/OR/XOR 放开。COM19 selftest-only
+  结果 `35/35 PASS`；切回正常主程序后 app-flash 成功，30 秒启动冒烟无 WDT/panic，到达
+  `Booting from 0000:7c00` 与 `set VGA mode 1`。
 
 #### Task 2.3 — NEG/NOT/INC/DEC
 - **目标**：NEG 用 `JIT_CC_NEG32`；NOT 不影响标志；**INC/DEC 必须保留 CF**（历史失败点）。

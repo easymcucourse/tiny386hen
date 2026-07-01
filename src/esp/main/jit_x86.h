@@ -43,6 +43,21 @@ typedef struct FPU FPU;
 #define TINY386_JIT_BAIL_REASONS 1
 #endif
 
+/*
+ * Verbose translation/execution trace.  Keep disabled by default because the
+ * serial path is slow enough to perturb normal boot smoke tests.
+ */
+#ifndef TINY386_JIT_TRACE
+#define TINY386_JIT_TRACE 0
+#endif
+
+/*
+ * Periodic stats dump cadence, measured in JIT attempts.  Set to 0 to disable.
+ */
+#ifndef TINY386_JIT_STATS_PERIOD
+#define TINY386_JIT_STATS_PERIOD 0
+#endif
+
 /* Guest page granularity used for future self-modifying-code tracking. */
 #define JIT_GUEST_PAGE_SIZE 4096u
 #define JIT_GUEST_PAGE_MASK (~(JIT_GUEST_PAGE_SIZE - 1u))
@@ -241,6 +256,8 @@ typedef struct {
     uint32_t bailed;        /* Blocks that could not be compiled. */
     uint32_t invalidations; /* Cache entries dropped by SMC/reset. */
     uint32_t smc_flushes;   /* Page/range invalidations requested. */
+    uint32_t bail_counts[JIT_BAIL_POOL_FULL + 1u];
+    uint32_t stats_ticks;   /* Attempts since last periodic stats dump. */
 } JITState;
 
 /* ------------------------------------------------------------------ */

@@ -80,7 +80,7 @@
 /*
  * Run jit_selftest at i386_task entry (production boot path, no LCD/I2S/USB/SD).
  */
-#define TINY386_JIT_SELFTEST_AT_BOOT 1
+#define TINY386_JIT_SELFTEST_AT_BOOT 0
 
 /*
  * 2:1 downscale rendering so that VGA 80-column text mode (640×400 pixels

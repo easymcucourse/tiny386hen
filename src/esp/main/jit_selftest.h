@@ -12,6 +12,7 @@ typedef struct JITCpuSnapshot {
 	uint32_t gpr[8];
 	uint32_t ip;
 	uint32_t next_ip;
+	uint32_t cycle;
 	uword flags;
 } JITCpuSnapshot;
 

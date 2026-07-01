@@ -422,7 +422,7 @@ static void i386_task(void *arg)
 	                    pdFALSE,
 	                    pdFALSE,
 	                    portMAX_DELAY);
-#ifdef TINY386_JIT_SELFTEST_AT_BOOT
+#if TINY386_JIT_SELFTEST_AT_BOOT
 	(void)config;
 	esp_rom_printf("[boot] JIT selftest (no LCD/I2S/USB/SD)\n");
 	jit_selftest_run_blocking();
@@ -523,7 +523,7 @@ static int load_ini_from_partition(void)
 
 void app_main(void)
 {
-#ifdef TINY386_JIT_SELFTEST_ONLY
+#if TINY386_JIT_SELFTEST_ONLY
 	esp_psram_init();
 	esp_rom_printf("[boot] JIT selftest-only (no LCD/I2S/USB/SD)\n");
 #ifdef BUILD_ESP32
@@ -551,7 +551,7 @@ void app_main(void)
 	}
 #endif
 
-#ifndef TINY386_JIT_SELFTEST_AT_BOOT
+#if !TINY386_JIT_SELFTEST_AT_BOOT
 	startup_resources_mount();
 	i2s_main();
 	storage_init();
@@ -603,13 +603,13 @@ void app_main(void)
 	}
 
 	if (config.enable_usb) {
-#ifndef TINY386_JIT_SELFTEST_AT_BOOT
+#if !TINY386_JIT_SELFTEST_AT_BOOT
 		usb_setup();
 #endif
 	}
 
 	if (psram) {
-#ifdef TINY386_JIT_SELFTEST_AT_BOOT
+#if TINY386_JIT_SELFTEST_AT_BOOT
 		debugcon_init();
 		xEventGroupSetBits(global_event_group, TINY386_EVENT_LOGO_READY);
 		xTaskCreatePinnedToCore(i386_task, "i386_main", 16384, &config, 3, NULL, 1);

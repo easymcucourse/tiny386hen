@@ -5519,6 +5519,7 @@ void jit_cpu_snapshot(CPUI386 *cpu, JITCpuSnapshot *snap)
 		snap->gpr[i] = REGi(i);
 	snap->ip = cpu->ip;
 	snap->next_ip = cpu->next_ip;
+	snap->cycle = (uint32_t)cpu->cycle;
 	snap->flags = cpu_getflags(cpu);
 }
 
@@ -5528,6 +5529,7 @@ void jit_cpu_restore(CPUI386 *cpu, const JITCpuSnapshot *snap)
 		REGi(i) = snap->gpr[i];
 	cpu->ip = snap->ip;
 	cpu->next_ip = snap->next_ip;
+	cpu->cycle = snap->cycle;
 	cpu->flags = snap->flags;
 	cpu->cc.mask = 0;
 	cpu->ifetch.paddr = 0;

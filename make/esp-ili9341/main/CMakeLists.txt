@@ -67,7 +67,10 @@ add_definitions(-include ${TINY386_ESP_SRC_ROOT}/board_${BOARD}.h)
 add_definitions(-DI386_ENABLE_FPU)
 
 # JIT: enable on ESP32 only via per-source compile flags (level 1 = NOP-only baseline).
-set(TINY386_JIT_COMPILE_FLAGS "-DTINY386_ENABLE_JIT -DTINY386_JIT_LEVEL=1")
+set(TINY386_JIT_TRACE "0" CACHE STRING "Enable verbose JIT translate/execute trace")
+set(TINY386_JIT_STATS_PERIOD "2048" CACHE STRING "Dump JIT stats every N attempts; 0 disables")
+set(TINY386_JIT_COMPILE_FLAGS
+    "-DTINY386_ENABLE_JIT -DTINY386_JIT_LEVEL=1 -DTINY386_JIT_TRACE=${TINY386_JIT_TRACE} -DTINY386_JIT_STATS_PERIOD=${TINY386_JIT_STATS_PERIOD}")
 
 target_link_options(${COMPONENT_LIB} INTERFACE
     -Wl,--wrap=sdmmc_init_spi_crc
