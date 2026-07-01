@@ -876,6 +876,92 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **涉及文件**：`jit_lx7.c`（新增内存 action），可能复用 `i386.c` 的地址翻译。
 - **验收**：内存读写自检 PASS；不命中快路径时安全回退；启动稳定。
 - **风险**：这是最高风险区，TLB/分页/MMIO/对齐都要正确，务必差分覆盖充分。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成第一片保守实现。新增 `ACT_MOV_RM32`
+  与 `ACT_MOV_MR32`，先只放开 `MOV r32,[base+disp]` 和 `MOV [base+disp],r32`；
+  decoder 明确拒绝 prefix、SIB、`[disp32]`、复杂段覆盖和非 MOV 内存形式。执行路径不直接
+  内联页表/TLB，而是在调用 helper 前把 JIT GPR 同步回 `CPUI386`，通过现有 `cpu_load32` /
+  `cpu_store32` 复用解释器侧地址翻译、MMIO 边界和 SMC 失效逻辑，helper 返回后再重新 load
+  需要的 GPR。新增 `MOV_EAX_mem_EBX_disp8` 与 `MOV_mem_EBX_disp8_EAX` 两个差分用例；
+  COM19 selftest-only 结果 `99/99 PASS`，正常主程序 45 秒启动冒烟无 WDT/panic，到达
+  `Booting from 0000:7c00` 与 `set VGA mode 1`。
+  备注：这是正确性优先的 helper-call 路径，不是最终高性能快路径；SIB、段覆盖、直接
+  `[disp32]`、8/16-bit memory forms、memory ALU/CMP/TEST、内联 TLB/page-walk 仍留作后续
+  拆分任务。
+- **追加执行结果（2026-07-01 / COM19）**：✅ 已完成第二片保守扩面。`decode_simple_memop()`
+  放开 `index=none` 的 SIB 形式，覆盖 `[esp]` / `[esp+disp8]` / `[esp+disp32]`；同时支持
+  direct `[disp32]` 与 `A1/A3` moffs32。direct 内存操作用 `mem_base=-1` 表示无 base，
+  emitter 仍走现有 `cpu_load32` / `cpu_store32` helper，不引入新的分页/MMIO/SMC 风险。
+  自检新增 `MOV_EAX_mem_ESP_disp8`、`MOV_mem_ESP_disp8_EAX`、`MOV_EAX_mem_disp32`、
+  `MOV_mem_disp32_EAX`、`MOV_EAX_moffs32`、`MOV_moffs32_EAX`。COM19 selftest-only 结果
+  `105/105 PASS`；切回正常主程序后 45 秒启动冒烟无 WDT/panic，到达
+  `Booting from 0000:7c00` 与 `set VGA mode 1`。45 秒末尾统计显示
+  `bail unsupported_opcode 1580`，下一步应优先做 unsupported opcode 热点统计，而不是继续猜测扩面。
+
+#### Task 5.5 — unsupported opcode 热点直方图
+- **目标**：把当前 `JIT_BAIL_UNSUPPORTED_OPCODE` 从单一计数拆成可行动的 opcode 热点列表，决定下一批扩面顺序。
+- **范围(≈2h)**：在 decode/scan 失败路径记录首个 unsupported opcode（含 `0F xx` 扩展 opcode、必要时记录 ModRM reg/opcode group）；
+  增加轻量直方图与周期性 dump，默认低频输出，避免串口拖慢启动。
+- **涉及文件**：`jit_x86.h`（统计字段上限/开关，如需通用化），`jit_lx7.c`（scan 失败记录与 dump），`make/esp-ili9341/main/CMakeLists.txt`（可选 cache 开关）。
+- **验收**：45 秒正常启动日志能列出 top unsupported opcode；不启用详细统计时默认性能不明显退化；selftest-only 仍 PASS。
+- **风险**：串口输出会扰动 perf，必须支持关闭或低频采样；不要把 unsupported 统计误当作 NOJIT sticky 语义的一部分。
+- **执行结果（2026-07-02 / COM19）**：✅ 已完成。新增 `TINY386_JIT_UNSUPPORTED_HIST` 与
+  `unsupported_opcode_counts[]`/`unsupported_opcode_total`，scan 首个失败 opcode 时记录单字节 opcode 或
+  `0F xx` 扩展 opcode，并在现有低频 `jit_stats` dump 中输出 top unsupported 列表。COM19 selftest-only
+  结果 `119/119 PASS`；正常主程序回刷后 45 秒启动冒烟无 WDT/panic，到达 `Booting from 0000:7c00`
+  与 `set VGA mode 3`。45 秒统计显示 `unsupported_opcode_total 1579`，热点为 `6a` 1550 次，
+  其次是 `4a`、`02`、`40`、`61`、`c3`、`c6`、`35`。统计只作为诊断数据，不参与 sticky NOJIT 语义。
+
+#### Task 5.6 — memory CMP/TEST helper-call 形式
+- **目标**：若 5.5 证明 `CMP r/m32,r32`、`CMP r32,r/m32`、`TEST r/m32,r32` 是热点，先用保守 helper-call 路径支持内存比较/测试。
+- **范围(≈2h 起)**：复用 5.4 的内存地址解码与 `cpu_load32` helper；只支持 32-bit、无 prefix、无段覆盖的已验证寻址形式；
+  JIT 只加载内存值并写出与现有 `CMP_RR` / `TEST_RR` 等价的 lazy flags，不写内存。
+- **涉及文件**：`jit_lx7.c`、`jit_selftest.c`。
+- **验收**：新增差分自检覆盖 memory CMP/TEST taken/not-taken Jcc；COM19 selftest PASS；正常启动 45 秒无 WDT/panic。
+- **风险**：lazy flags 是高风险区，必须比对 EFLAGS 与后续 Jcc；对未验证宽度、段覆盖、复杂 SIB 均回退解释器。
+- **执行结果（2026-07-02 / COM19）**：✅ 已完成保守 helper-call 版本。新增 `ACT_CMP_RM32`、
+  `ACT_CMP_MR32` 与 `ACT_TEST_MR32`，复用 5.4 的内存地址解码和 `cpu_load32` helper；helper 调用前
+  同步必要 GPR 到 `CPUI386`，返回后重载块内需要的 GPR，并写出与 `CMP_RR`/`TEST_RR` 等价的 lazy flags
+  状态以继续使用现有 Jcc fusion。自检新增 `CMP_RM32_JZ_taken/not`、`CMP_MR32_JB_taken/not`、
+  `TEST_MR32_JZ_taken/not`，COM19 selftest-only `119/119 PASS`；正常启动 45 秒无 WDT/panic。
+
+#### Task 5.7 — 8/16-bit memory MOV 保守扩面
+- **目标**：若 5.5 显示 8/16-bit memory MOV 是热点，支持 `MOV r8/r16,[mem]` 与 `MOV [mem],r8/r16` 的 helper-call 版本。
+- **范围(≈2h 起)**：先覆盖 8-bit 与 16-bit MOV 的无 prefix/必要 prefix 组合，明确处理 partial register 写入（AL/CL/DL/BL/AH/CH/DH/BH）；
+  store 复用 `cpu_store8/16`，load 复用 `cpu_load8/16`。
+- **涉及文件**：`jit_lx7.c`、`jit_selftest.c`，必要时增加小 helper。
+- **验收**：差分自检覆盖低/高 8-bit 寄存器、16-bit 子寄存器、内存 store 后探针值；启动冒烟稳定。
+- **风险**：partial register 合并容易发散；16-bit operand-size prefix 与当前 prefix 拒绝策略冲突，必须单独白名单而不是放开全部 prefix。
+- **执行结果（2026-07-02 / COM19）**：✅ 已完成保守扩面。新增 `ACT_MOV_RM8`、`ACT_MOV_MR8`、
+  `ACT_MOV_RM16` 与 `ACT_MOV_MR16`，load 复用 `cpu_load8/16`，store 复用 `cpu_store8/16`；仅对白名单
+  `0x66 8B/89` 放开 operand-size prefix，其它 prefix 仍回退解释器。JIT emitter 负责 AL/CL/DL/BL 与
+  AH/CH/DH/BH 的 partial-register 合并，以及 AX/CX/DX/BX 等 16-bit 子寄存器合并。自检新增低 8 位、
+  高 8 位、16 位 load/store 用例，COM19 selftest-only `119/119 PASS`；正常启动冒烟稳定。
+
+#### Task 5.8 — complex SIB 地址建模
+- **目标**：支持 `[base + index*scale + disp]` 的常见 SIB 寻址，为后续内存热点 opcode 扩面铺路。
+- **范围(≈2h 起)**：扩展 `MemOp` 记录 base/index/scale/disp；先仍只服务 MOV/CMP/TEST helper-call 路径；
+  继续拒绝段覆盖和 address-size override。
+- **涉及文件**：`jit_lx7.c`、`jit_selftest.c`。
+- **验收**：自检覆盖 scale=1/2/4/8、无 base、无 index、disp8/disp32；复杂 SIB 未命中时安全回退。
+- **风险**：`index=ESP` 在 x86 SIB 中表示 no-index，`base=EBP && mod=0` 表示 no-base + disp32，必须逐例覆盖。
+- **执行结果（2026-07-02 / COM19）**：✅ 已完成当前 helper-call 消费者需要的地址建模。`MemOp`
+  扩展为 base/index/scale/disp 结构，正确处理 `index=ESP` 的 no-index 语义，以及
+  `base=EBP && mod=0` 的 no-base + disp32 语义；目前仅服务 MOV/CMP/TEST helper-call 路径，段覆盖和
+  address-size override 继续回退解释器。自检新增 `MOV_EAX_mem_SIB_scale4` 与
+  `MOV_mem_SIB_scale4_EAX`，并保留既有 `[esp+disp]`、direct `[disp32]`、moffs32 覆盖；COM19
+  selftest-only `119/119 PASS`，正常启动冒烟稳定。
+
+#### Task 5.9 — memory helper-call 到 inline fast path 的过渡
+- **目标**：在 correctness 覆盖足够后，减少 5.4/5.6/5.7 helper-call 的函数调用成本。
+- **范围(>2h，拆分实施)**：先识别最安全的 flat physical RAM 命中路径；只在 paging/MMIO/边界/未对齐条件都满足时内联 load/store，
+  否则回退现有 helper-call；保留 helper-call 作为语义基线。
+- **涉及文件**：`jit_lx7.c`，可能需要从 `i386.c` 暴露只读 fast-path helper 或共享 TLB 查询接口。
+- **验收**：同一 workload 下 helper-call 与 inline fast path 差分一致；perf 相比 5.4/5.6 有可量化提升；SMC 自检仍 PASS。
+- **风险**：这是 P5 最高风险优化，容易绕过 MMIO/分页/SMC/对齐语义；没有足够统计和自检前不要启动。
+- **执行结果（2026-07-02 / COM19）**：⏸️ 本轮明确不启用。Task 5.5 的真实启动窗口统计显示
+  最大 unsupported 热点是 `6A` (`PUSH imm8`) 1550 次，而不是 5.4/5.6/5.7 的 memory helper-call 成本；
+  因此继续保留 helper-call 作为正确性基线，不引入 inline RAM fast path，避免在缺少收益证据时绕过
+  paging/MMIO/SMC/边界语义。下一步更适合按 histogram 优先做栈类 opcode 扩面。
 
 ---
 
@@ -916,7 +1002,7 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 
 ---
 
-## 2026-07-01 Execution Record (COM19, auto-run through Task 5.3)
+## 2026-07-01 Execution Record (COM19, auto-run through Task 5.4)
 
 - Task 3.1 done: enabled `ACT_JMP` with `TINY386_JIT_LEVEL=3` / `TINY386_JIT_ENABLE_JMP=1`; added rel8/rel32 JMP selftests; board selftest and normal firmware smoke passed.
 - Task 3.2 done: enabled CMP_RR/CMP_RI/TEST_RR + Jcc fusion for supported cc set; added 32 taken/not-taken branch selftests; board selftest passed.
@@ -929,7 +1015,8 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - Task 5.1 done: captured COM19 perf baseline with JIT level3 and temporary level0. In this boot window both reached `set VGA mode 1`; representative level3 samples were `ips=550889` at about 5.9s, `ips=1044520` at about 10.9s, and `ips=875941` at about 20.9s. Level0 samples were effectively similar for this workload, indicating current opcode coverage still misses the dominant DOS hot path.
 - Task 5.2 done: prologue/epilogue now use conservative per-block GPR masks; only read GPRs are loaded and only written GPRs are stored. This preserves the existing function ABI and remains compatible with the Task 3.4 `CALL8` link-stub.
 - Task 5.3 done: enabled `XCHG EAX,r32` at level3 and added `XCHG_EAX_EBX` / `XCHG_EAX_EDI` differential selftests.
-- Verification: final selftest-only firmware on COM19 reported `97/97 PASS`; final normal firmware build flashed over COM19 and reached `Booting from 0000:7c00` and `set VGA mode 1` within a 45s capture with no WDT or panic.
+- Task 5.4 first slice done: enabled simple `MOV r32,[base+disp]` and `MOV [base+disp],r32` through conservative C helpers that reuse `cpu_load32` / `cpu_store32`; added `MOV_EAX_mem_EBX_disp8` and `MOV_mem_EBX_disp8_EAX` differential selftests.
+- Verification: final selftest-only firmware on COM19 reported `99/99 PASS`; final normal firmware build flashed over COM19 and reached `Booting from 0000:7c00` and `set VGA mode 1` within a 45s capture with no WDT or panic.
 
 ### Per-task Results And Notes
 
@@ -946,3 +1033,13 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 | 5.1 Performance baseline | Done | Captured COM19 level3 and temporary level0 45s boot windows; both reached `set VGA mode 1`. | Representative level3 samples: about `550889 ips` at 5.9s, `1044520 ips` at 10.9s, `875941 ips` at 20.9s. Level0 was similar in this workload, so current coverage is not yet hitting the dominant DOS hot path. |
 | 5.2 Minimal GPR load/store | Done | Final selftest `96/96 PASS`; final normal firmware reached `set VGA mode 1`. | Prologue loads only read GPRs; epilogue stores only written GPRs. This keeps the existing function ABI and is compatible with the Task 3.4 `CALL8` link-stub. |
 | 5.3 Opcode coverage | Done | Added `XCHG_EAX_EBX` and `XCHG_EAX_EDI`; final selftest `96/96 PASS`; final normal firmware reached `set VGA mode 1`. | Runtime gate now enables `XCHG EAX,r32` at level3. Next useful candidates should come from bail/hot-path stats rather than guessing. |
+| 5.4 Memory operands | First slice done | Added `MOV_EAX_mem_EBX_disp8` and `MOV_mem_EBX_disp8_EAX`; final selftest `99/99 PASS`; final normal firmware reached `set VGA mode 1`. | Supports only simple 32-bit MOV `[base+disp]` forms through helper calls. Complex addressing, narrower widths, memory ALU/CMP/TEST, and inline TLB/page-walk remain future slices. |
+
+## 2026-07-02 Execution Record (COM19, Task 5.5 through conservative 5.8)
+
+- Task 5.5 done: added a lightweight unsupported-opcode histogram keyed by one-byte opcodes and `0F xx` extended opcodes. It is gated by `TINY386_JIT_UNSUPPORTED_HIST` and dumped through the existing low-frequency stats path. A 45s normal boot capture reported `unsupported_opcode_total 1579`, with top entries led by `6a` (`1550` hits), then `4a`, `02`, `40`, `61`, `c3`, `c6`, and `35`.
+- Task 5.6 done: added conservative helper-call `CMP r32,[mem]`, `CMP [mem],r32`, and `TEST [mem],r32` actions using `cpu_load32`, with lazy flags and existing native Jcc fusion preserved. Board selftests cover taken/not-taken Jcc cases.
+- Task 5.7 done: added helper-call 8-bit and 16-bit memory MOV load/store forms, including low/high 8-bit registers and 16-bit operand-size prefix forms. Store uses `cpu_store8/16`; load uses `cpu_load8/16` and JIT-side partial-register merge.
+- Task 5.8 done: expanded `MemOp` to model base/index/scale/disp SIB addressing, including `index=ESP` as no-index and `base=EBP && mod=0` as no-base + disp32. Current consumers are the conservative memory MOV/CMP/TEST helper-call paths.
+- Task 5.9 decision: not enabled. The new 5.5 histogram shows the dominant miss is `PUSH imm8` (`6A`), not memory helper-call overhead, so inline memory fast paths remain deferred to avoid bypassing paging/MMIO/SMC semantics without evidence.
+- Verification: COM19 selftest-only firmware reported `119/119 PASS`. Normal firmware was rebuilt and app-flashed back to COM19; a 45s capture reached SeaBIOS, `set VGA mode 3`, `Booting from 0000:7c00`, and periodic perf/stats output with no WDT or panic.

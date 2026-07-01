@@ -46,6 +46,13 @@
 #define ACT_XCHG_EAX_R 19
 #define ACT_MOV_RM32   21
 #define ACT_MOV_MR32   22
+#define ACT_MOV_RM8    23
+#define ACT_MOV_MR8    24
+#define ACT_MOV_RM16   25
+#define ACT_MOV_MR16   26
+#define ACT_CMP_RM32   27
+#define ACT_CMP_MR32   28
+#define ACT_TEST_MR32  29
 
 #define JIT_ST_ALLOW(act)  (1u << (unsigned)(act))
 
@@ -113,6 +120,9 @@ typedef enum {
 	BR_SRC_CMP_RR,
 	BR_SRC_CMP_RI,
 	BR_SRC_TEST_RR,
+	BR_SRC_CMP_RM32,
+	BR_SRC_CMP_MR32,
+	BR_SRC_TEST_MR32,
 } BranchSourceOp;
 
 typedef struct {
@@ -160,6 +170,28 @@ static const uint8_t code_xchg_eax_ebx[] = { 0x93 };
 static const uint8_t code_xchg_eax_edi[] = { 0x97 };
 static const uint8_t code_mov_eax_mem_ebx_disp8[] = { 0x8B, 0x43, 0x20 };
 static const uint8_t code_mov_mem_ebx_disp8_eax[] = { 0x89, 0x43, 0x24 };
+static const uint8_t code_mov_eax_mem_esp_disp8[] = { 0x8B, 0x44, 0x24, 0x20 };
+static const uint8_t code_mov_mem_esp_disp8_eax[] = { 0x89, 0x44, 0x24, 0x24 };
+static const uint8_t code_mov_eax_mem_disp32[] = {
+	0x8B, 0x05, 0x20, 0x18, 0x00, 0x00,
+};
+static const uint8_t code_mov_mem_disp32_eax[] = {
+	0x89, 0x05, 0x24, 0x18, 0x00, 0x00,
+};
+static const uint8_t code_mov_eax_moffs32[] = {
+	0xA1, 0x20, 0x18, 0x00, 0x00,
+};
+static const uint8_t code_mov_moffs32_eax[] = {
+	0xA3, 0x24, 0x18, 0x00, 0x00,
+};
+static const uint8_t code_mov_al_mem_ebx_disp8[] = { 0x8A, 0x43, 0x20 };
+static const uint8_t code_mov_ah_mem_ebx_disp8[] = { 0x8A, 0x63, 0x20 };
+static const uint8_t code_mov_mem_ebx_disp8_cl[] = { 0x88, 0x4B, 0x24 };
+static const uint8_t code_mov_mem_ebx_disp8_ah[] = { 0x88, 0x63, 0x24 };
+static const uint8_t code_mov_ax_mem_ebx_disp8[] = { 0x66, 0x8B, 0x43, 0x20 };
+static const uint8_t code_mov_mem_ebx_disp8_ax[] = { 0x66, 0x89, 0x43, 0x24 };
+static const uint8_t code_mov_eax_mem_sib_scale4[] = { 0x8B, 0x44, 0x8B, 0x20 };
+static const uint8_t code_mov_mem_sib_scale4_eax[] = { 0x89, 0x44, 0x8B, 0x24 };
 static const uint8_t code_jmp_rel8[] = {
 	0xEB, 0x03,                   /* jmp +3 */
 	0xB8, 0x11, 0x11, 0x11, 0x11, /* skipped */
@@ -253,6 +285,15 @@ static uint8_t build_branch_code(const BranchSelftestCase *tc, uint8_t *code)
 		break;
 	case BR_SRC_TEST_RR:
 		code[len++] = 0x85; code[len++] = 0xD8; /* test eax,ebx */
+		break;
+	case BR_SRC_CMP_RM32:
+		code[len++] = 0x3B; code[len++] = 0x43; code[len++] = 0x20; /* cmp eax,[ebx+0x20] */
+		break;
+	case BR_SRC_CMP_MR32:
+		code[len++] = 0x39; code[len++] = 0x43; code[len++] = 0x20; /* cmp [ebx+0x20],eax */
+		break;
+	case BR_SRC_TEST_MR32:
+		code[len++] = 0x85; code[len++] = 0x43; code[len++] = 0x20; /* test [ebx+0x20],eax */
 		break;
 	default:
 		return 0;
@@ -464,9 +505,17 @@ static void init_mem_state(CPUI386 *cpu)
 {
 	for (int i = 0; i < 8; i++)
 		cpui386_set_gpr(cpu, i, 0x23242526u + (uint32_t)i);
-	cpui386_set_gpr(cpu, 0, 0x89abcdefu);
+	cpui386_set_gpr(cpu, 0, 0x00000001u);
 	cpui386_set_gpr(cpu, 3, 0x00001800u);
+	cpui386_set_gpr(cpu, 4, 0x00001800u);
 	cpu_setflags(cpu, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF, 0);
+}
+
+static void init_mem_sib_state(CPUI386 *cpu)
+{
+	init_mem_state(cpu);
+	cpui386_set_gpr(cpu, 1, 0x00000004u);
+	cpui386_set_gpr(cpu, 3, 0x00001800u);
 }
 
 static const char *gpr_name(int i)
@@ -761,6 +810,14 @@ static void setup_mem_fixture(uint8_t *mem)
 	mem[0x1825] = 0xbb;
 	mem[0x1826] = 0xcc;
 	mem[0x1827] = 0xdd;
+	mem[0x1830] = 0x88;
+	mem[0x1831] = 0x77;
+	mem[0x1832] = 0x66;
+	mem[0x1833] = 0x55;
+	mem[0x1834] = 0x12;
+	mem[0x1835] = 0x34;
+	mem[0x1836] = 0x56;
+	mem[0x1837] = 0x78;
 }
 
 static bool run_memory_mov_case(CPUI386 *cpu, uint8_t *mem,
@@ -942,9 +999,13 @@ static void setup_branch_cpu(CPUI386 *cpu, uint8_t *mem,
 
 	cpui386_reset_pm(cpu, ST_CODE_BASE);
 	memset(mem + ST_CODE_BASE, 0xcc, 64);
+	setup_mem_fixture(mem);
 	memcpy(mem + ST_CODE_BASE, code, code_len);
 	cpui386_set_gpr(cpu, 0, tc->eax);
 	cpui386_set_gpr(cpu, 3, tc->ebx);
+	if (tc->src_op == BR_SRC_CMP_RM32 || tc->src_op == BR_SRC_CMP_MR32 ||
+	    tc->src_op == BR_SRC_TEST_MR32)
+		cpui386_set_gpr(cpu, 3, 0x00001800u);
 	for (int i = 1; i < 8; i++) {
 		if (i != 3)
 			cpui386_set_gpr(cpu, i, 0x71727374u + (uint32_t)i);
@@ -967,6 +1028,9 @@ static bool run_branch_case(CPUI386 *cpu, uint8_t *mem,
 	case BR_SRC_CMP_RR:  allow |= JIT_ST_ALLOW(ACT_CMP_RR); break;
 	case BR_SRC_CMP_RI:  allow |= JIT_ST_ALLOW(ACT_CMP_RI); break;
 	case BR_SRC_TEST_RR: allow |= JIT_ST_ALLOW(ACT_TEST_RR); break;
+	case BR_SRC_CMP_RM32: allow |= JIT_ST_ALLOW(ACT_CMP_RM32); break;
+	case BR_SRC_CMP_MR32: allow |= JIT_ST_ALLOW(ACT_CMP_MR32); break;
+	case BR_SRC_TEST_MR32: allow |= JIT_ST_ALLOW(ACT_TEST_MR32); break;
 	}
 
 	setup_branch_cpu(cpu, mem, tc);
@@ -1265,6 +1329,104 @@ int jit_selftest_run(void)
 			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR32),
 			.init = init_mem_state,
 		},
+		{
+			.name = "MOV_EAX_mem_ESP_disp8",
+			.code = code_mov_eax_mem_esp_disp8,
+			.code_len = sizeof(code_mov_eax_mem_esp_disp8),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_RM32),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_mem_ESP_disp8_EAX",
+			.code = code_mov_mem_esp_disp8_eax,
+			.code_len = sizeof(code_mov_mem_esp_disp8_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR32),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_EAX_mem_disp32",
+			.code = code_mov_eax_mem_disp32,
+			.code_len = sizeof(code_mov_eax_mem_disp32),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_RM32),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_mem_disp32_EAX",
+			.code = code_mov_mem_disp32_eax,
+			.code_len = sizeof(code_mov_mem_disp32_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR32),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_EAX_moffs32",
+			.code = code_mov_eax_moffs32,
+			.code_len = sizeof(code_mov_eax_moffs32),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_RM32),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_moffs32_EAX",
+			.code = code_mov_moffs32_eax,
+			.code_len = sizeof(code_mov_moffs32_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR32),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_AL_mem_EBX_disp8",
+			.code = code_mov_al_mem_ebx_disp8,
+			.code_len = sizeof(code_mov_al_mem_ebx_disp8),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_RM8),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_AH_mem_EBX_disp8",
+			.code = code_mov_ah_mem_ebx_disp8,
+			.code_len = sizeof(code_mov_ah_mem_ebx_disp8),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_RM8),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_mem_EBX_disp8_CL",
+			.code = code_mov_mem_ebx_disp8_cl,
+			.code_len = sizeof(code_mov_mem_ebx_disp8_cl),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR8),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_mem_EBX_disp8_AH",
+			.code = code_mov_mem_ebx_disp8_ah,
+			.code_len = sizeof(code_mov_mem_ebx_disp8_ah),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR8),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_AX_mem_EBX_disp8",
+			.code = code_mov_ax_mem_ebx_disp8,
+			.code_len = sizeof(code_mov_ax_mem_ebx_disp8),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_RM16),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_mem_EBX_disp8_AX",
+			.code = code_mov_mem_ebx_disp8_ax,
+			.code_len = sizeof(code_mov_mem_ebx_disp8_ax),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR16),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_EAX_mem_SIB_scale4",
+			.code = code_mov_eax_mem_sib_scale4,
+			.code_len = sizeof(code_mov_eax_mem_sib_scale4),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_RM32),
+			.init = init_mem_sib_state,
+		},
+		{
+			.name = "MOV_mem_SIB_scale4_EAX",
+			.code = code_mov_mem_sib_scale4_eax,
+			.code_len = sizeof(code_mov_mem_sib_scale4_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR32),
+			.init = init_mem_sib_state,
+		},
 	};
 	static const SelftestCase mixed_nop_mov = {
 		.name = "MIXED_NOP_THEN_MOV_EAX",
@@ -1385,6 +1547,12 @@ int jit_selftest_run(void)
 		{ "TEST_RR_JS_not",     BR_SRC_TEST_RR, 8, 0x7fffffffu,0xffffffffu,0, false },
 		{ "TEST_RR_JNS_taken",  BR_SRC_TEST_RR, 9, 0x7fffffffu,0xffffffffu,0, true },
 		{ "TEST_RR_JNS_not",    BR_SRC_TEST_RR, 9, 0x80000000u,0xffffffffu,0, false },
+		{ "CMP_RM32_JZ_taken",  BR_SRC_CMP_RM32, 4, 0x11223344u,0,          0, true },
+		{ "CMP_RM32_JZ_not",    BR_SRC_CMP_RM32, 4, 0x11223345u,0,          0, false },
+		{ "CMP_MR32_JB_taken",  BR_SRC_CMP_MR32, 2, 0x22334455u,0,          0, true },
+		{ "CMP_MR32_JB_not",    BR_SRC_CMP_MR32, 2, 0x00000001u,0,          0, false },
+		{ "TEST_MR32_JZ_taken", BR_SRC_TEST_MR32,4, 0x00000002u,0,          0, true },
+		{ "TEST_MR32_JZ_not",   BR_SRC_TEST_MR32,4, 0x00000004u,0,          0, false },
 	};
 	FlashReadProbe flash_before;
 	FlashReadProbe flash_after;
@@ -1432,11 +1600,18 @@ int jit_selftest_run(void)
 	}
 
 	for (size_t i = 0; i < case_count; i++) {
-		if (cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_RM32)) {
-			if (!run_memory_mov_case(cpu, mem, &cases[i], 0x1820))
-				failures++;
-		} else if (cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_MR32)) {
-			if (!run_memory_mov_case(cpu, mem, &cases[i], 0x1824))
+		if (cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_RM32) ||
+		    cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_MR32) ||
+		    cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_RM8) ||
+		    cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_MR8) ||
+		    cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_RM16) ||
+		    cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_MR16)) {
+			uint32_t probe = 0x1820;
+			if (strstr(cases[i].name, "SIB") != NULL)
+				probe = strstr(cases[i].name, "_mem_SIB_") != NULL ? 0x1834 : 0x1830;
+			else if (strstr(cases[i].name, "MOV_mem_") != NULL)
+				probe = 0x1824;
+			if (!run_memory_mov_case(cpu, mem, &cases[i], probe))
 				failures++;
 		} else if (!run_case(cpu, mem, &cases[i])) {
 			failures++;

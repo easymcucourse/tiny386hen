@@ -58,6 +58,20 @@ typedef struct FPU FPU;
 #define TINY386_JIT_STATS_PERIOD 0
 #endif
 
+/*
+ * Unsupported-opcode hot histogram. Keys 0x000-0x0ff are one-byte opcodes;
+ * keys 0x100-0x1ff are 0F xx extended opcodes.
+ */
+#ifndef TINY386_JIT_UNSUPPORTED_HIST
+#define TINY386_JIT_UNSUPPORTED_HIST 1
+#endif
+
+#ifndef TINY386_JIT_UNSUPPORTED_TOP
+#define TINY386_JIT_UNSUPPORTED_TOP 8
+#endif
+
+#define JIT_UNSUPPORTED_HIST_SIZE 512u
+
 /* Guest page granularity used for future self-modifying-code tracking. */
 #define JIT_GUEST_PAGE_SIZE 4096u
 #define JIT_GUEST_PAGE_MASK (~(JIT_GUEST_PAGE_SIZE - 1u))
@@ -270,6 +284,8 @@ typedef struct {
     uint32_t smc_flushes;   /* Page/range invalidations requested. */
     uint32_t smc_page_bitmap[JIT_SMC_PAGE_WORDS]; /* Hashed pages with translated code. */
     uint32_t bail_counts[JIT_BAIL_POOL_FULL + 1u];
+    uint32_t unsupported_opcode_counts[JIT_UNSUPPORTED_HIST_SIZE];
+    uint32_t unsupported_opcode_total;
     uint32_t stats_ticks;   /* Attempts since last periodic stats dump. */
 } JITState;
 

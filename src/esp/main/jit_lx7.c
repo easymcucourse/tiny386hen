@@ -668,6 +668,48 @@ jit_helper_mov_mr32(CPUI386 *cpu, uint32_t addr, uint32_t value)
     (void)cpu_store32(cpu, 3, addr, value);
 }
 
+static uint32_t __attribute__((noinline))
+jit_helper_load8(CPUI386 *cpu, uint32_t addr)
+{
+    uint8_t value = 0;
+    (void)cpu_load8(cpu, 3, addr, &value);
+    return value;
+}
+
+static uint32_t __attribute__((noinline))
+jit_helper_load16(CPUI386 *cpu, uint32_t addr)
+{
+    uint16_t value = 0;
+    (void)cpu_load16(cpu, 3, addr, &value);
+    return value;
+}
+
+static uint32_t __attribute__((noinline))
+jit_helper_load32(CPUI386 *cpu, uint32_t addr)
+{
+    uint32_t value = 0;
+    (void)cpu_load32(cpu, 3, addr, &value);
+    return value;
+}
+
+static void __attribute__((noinline))
+jit_helper_store8(CPUI386 *cpu, uint32_t addr, uint32_t value)
+{
+    (void)cpu_store8(cpu, 3, addr, (uint8_t)value);
+}
+
+static void __attribute__((noinline))
+jit_helper_store16(CPUI386 *cpu, uint32_t addr, uint32_t value)
+{
+    (void)cpu_store16(cpu, 3, addr, (uint16_t)value);
+}
+
+static void __attribute__((noinline))
+jit_helper_store32(CPUI386 *cpu, uint32_t addr, uint32_t value)
+{
+    (void)cpu_store32(cpu, 3, addr, value);
+}
+
 /* ================================================================== */
 /*  Section 3 — x86 Instruction Decoder (scan-only, no execution)     */
 /* ================================================================== */
@@ -691,8 +733,12 @@ typedef struct {
 
 typedef struct {
     int base;
+    int index;
+    int scale;
     int32_t disp;
     int len;
+    bool has_base;
+    bool has_index;
 } MemOp;
 
 static inline ModRM decode_modrm(uint8_t b)
@@ -709,11 +755,32 @@ static bool decode_simple_memop(const uint8_t *src, const ModRM *m, MemOp *mem)
 {
     int len = 0;
     int32_t disp = 0;
+    int base = m->rm;
+    int index = -1;
+    int scale = 0;
+    bool has_base = true;
+    bool has_index = false;
 
-    if (m->reg_only || m->rm == 4)
+    if (m->reg_only)
         return false;
-    if (m->mod == 0 && m->rm == 5)
-        return false;
+
+    if (m->rm == 4) {
+        uint8_t sib = src[len++];
+        int sib_scale = (sib >> 6) & 3;
+        int sib_index = (sib >> 3) & 7;
+        int sib_base = sib & 7;
+
+        if (sib_index != 4) {
+            has_index = true;
+            index = sib_index;
+            scale = sib_scale;
+        }
+        if (m->mod == 0 && sib_base == 5)
+            has_base = false;
+        base = sib_base;
+    } else if (m->mod == 0 && m->rm == 5) {
+        has_base = false;
+    }
 
     if (m->mod == 1) {
         disp = (int32_t)(int8_t)src[len++];
@@ -723,11 +790,21 @@ static bool decode_simple_memop(const uint8_t *src, const ModRM *m, MemOp *mem)
                          ((uint32_t)src[len + 2] << 16) |
                          ((uint32_t)src[len + 3] << 24));
         len += 4;
+    } else if (!has_base) {
+        disp = (int32_t)((uint32_t)src[len] |
+                         ((uint32_t)src[len + 1] << 8) |
+                         ((uint32_t)src[len + 2] << 16) |
+                         ((uint32_t)src[len + 3] << 24));
+        len += 4;
     }
 
-    mem->base = m->rm;
+    mem->base = base;
+    mem->index = index;
+    mem->scale = scale;
     mem->disp = disp;
     mem->len = len;
+    mem->has_base = has_base;
+    mem->has_index = has_index;
     return true;
 }
 
@@ -760,8 +837,15 @@ typedef enum {
     ACT_CDQ,        /* EDX = sign_extend(EAX), no flags */
     ACT_XCHG_EAX_R, /* swap EAX with another GPR, no flags */
     ACT_BSWAP_R,    /* byte-swap a 32-bit GPR, no flags */
-    ACT_MOV_RM32,   /* dst_reg = dword ptr [base_reg + disp] */
-    ACT_MOV_MR32,   /* dword ptr [base_reg + disp] = src_reg */
+    ACT_MOV_RM32,   /* dst_reg = dword ptr [base_reg + disp] or [disp32] */
+    ACT_MOV_MR32,   /* dword ptr [base_reg + disp] or [disp32] = src_reg */
+    ACT_MOV_RM8,    /* dst r8 = byte ptr [mem] */
+    ACT_MOV_MR8,    /* byte ptr [mem] = src r8 */
+    ACT_MOV_RM16,   /* dst r16 = word ptr [mem] */
+    ACT_MOV_MR16,   /* word ptr [mem] = src r16 */
+    ACT_CMP_RM32,   /* cmp r32, dword ptr [mem] */
+    ACT_CMP_MR32,   /* cmp dword ptr [mem], r32 */
+    ACT_TEST_MR32,  /* test dword ptr [mem], r32 */
     ACT_BLOCK_END,  /* last instruction of block, no jump */
 } ActionType;
 
@@ -786,7 +870,9 @@ typedef struct {
     int        dst;       /* x86 GPR index 0-7 */
     int        src;       /* x86 GPR index 0-7 (or shift amount) */
     int32_t    imm;       /* immediate value */
-    int        mem_base;  /* x86 base GPR for simple memory operands */
+    int        mem_base;  /* x86 base GPR, or -1 for direct [disp32] */
+    int        mem_index; /* x86 index GPR, or -1 for no index */
+    int        mem_scale; /* SIB scale shift: 0,1,2,3 */
     int32_t    mem_disp;  /* signed displacement for simple memory operands */
     AluOp      alu_op;
     ShiftOp    sh_op;
@@ -824,6 +910,13 @@ static const char *jit_action_name(ActionType type)
     case ACT_BSWAP_R:     return "BSWAP_R";
     case ACT_MOV_RM32:    return "MOV_RM32";
     case ACT_MOV_MR32:    return "MOV_MR32";
+    case ACT_MOV_RM8:     return "MOV_RM8";
+    case ACT_MOV_MR8:     return "MOV_MR8";
+    case ACT_MOV_RM16:    return "MOV_RM16";
+    case ACT_MOV_MR16:    return "MOV_MR16";
+    case ACT_CMP_RM32:    return "CMP_RM32";
+    case ACT_CMP_MR32:    return "CMP_MR32";
+    case ACT_TEST_MR32:   return "TEST_MR32";
     case ACT_BLOCK_END:   return "BLOCK_END";
     default:              return "?";
     }
@@ -831,8 +924,10 @@ static const char *jit_action_name(ActionType type)
 
 static void jit_action_reg_masks(const X86Action *a, uint8_t *read_mask, uint8_t *write_mask)
 {
-    uint8_t dst = (uint8_t)(1u << a->dst);
-    uint8_t src = (uint8_t)(1u << a->src);
+    int dst_reg = a->dst & 7;
+    int src_reg = a->src & 7;
+    uint8_t dst = (uint8_t)(1u << dst_reg);
+    uint8_t src = (uint8_t)(1u << src_reg);
 
     switch (a->type) {
     case ACT_MOV_RR:
@@ -881,11 +976,50 @@ static void jit_action_reg_masks(const X86Action *a, uint8_t *read_mask, uint8_t
         *write_mask |= dst;
         break;
     case ACT_MOV_RM32:
-        *read_mask |= (uint8_t)(1u << a->mem_base);
+    case ACT_MOV_RM8:
+        dst = (uint8_t)(1u << (a->dst & 3));
+        if (a->mem_base >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_base);
+        if (a->mem_index >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_index);
+        *write_mask |= dst;
+        break;
+    case ACT_MOV_RM16:
+        if (a->mem_base >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_base);
+        if (a->mem_index >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_index);
         *write_mask |= dst;
         break;
     case ACT_MOV_MR32:
-        *read_mask |= src | (uint8_t)(1u << a->mem_base);
+    case ACT_MOV_MR16:
+        *read_mask |= src;
+        if (a->mem_base >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_base);
+        if (a->mem_index >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_index);
+        break;
+    case ACT_MOV_MR8:
+        *read_mask |= (uint8_t)(1u << (a->src & 3));
+        if (a->mem_base >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_base);
+        if (a->mem_index >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_index);
+        break;
+    case ACT_CMP_RM32:
+        *read_mask |= dst;
+        if (a->mem_base >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_base);
+        if (a->mem_index >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_index);
+        break;
+    case ACT_CMP_MR32:
+    case ACT_TEST_MR32:
+        *read_mask |= src;
+        if (a->mem_base >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_base);
+        if (a->mem_index >= 0)
+            *read_mask |= (uint8_t)(1u << a->mem_index);
         break;
     default:
         break;
@@ -916,13 +1050,23 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
 {
     int len = 0;
     memset(a, 0, sizeof(*a));
+    a->mem_base = -1;
+    a->mem_index = -1;
 
     uint8_t op = src[len++];
+    bool opsz16 = false;
 
     /* Reject all prefixes */
+    if (op == 0x66) {
+        opsz16 = true;
+        op = src[len++];
+    }
     if (op == 0x26 || op == 0x2E || op == 0x36 || op == 0x3E ||
-        op == 0x64 || op == 0x65 || op == 0x66 || op == 0x67 ||
+        op == 0x64 || op == 0x65 || op == 0x67 ||
         op == 0xF0 || op == 0xF2 || op == 0xF3)
+        return 0;
+
+    if (opsz16 && op != 0x89 && op != 0x8B)
         return 0;
 
     if (op == 0x90) {
@@ -978,7 +1122,19 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
     if ((op & 0x07) == 0x01 && op <= 0x39) {
         uint8_t alu = (op >> 3) & 7;
         ModRM m = decode_modrm(src[len++]);
-        if (!m.reg_only) return 0; /* memory operand */
+        if (!m.reg_only) {
+            MemOp mem;
+            if (alu != ALU_CMP || !decode_simple_memop(src + len, &m, &mem))
+                return 0;
+            len += mem.len;
+            a->type = ACT_CMP_MR32;
+            a->src = m.reg;
+            a->mem_base = mem.has_base ? mem.base : -1;
+            a->mem_index = mem.has_index ? mem.index : -1;
+            a->mem_scale = mem.scale;
+            a->mem_disp = mem.disp;
+            return len;
+        }
         if (alu == ALU_CMP) {
             a->type = ACT_CMP_RR; a->dst = m.rm; a->src = m.reg;
         } else {
@@ -992,7 +1148,19 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
     if ((op & 0x07) == 0x03 && op <= 0x3B) {
         uint8_t alu = (op >> 3) & 7;
         ModRM m = decode_modrm(src[len++]);
-        if (!m.reg_only) return 0;
+        if (!m.reg_only) {
+            MemOp mem;
+            if (alu != ALU_CMP || !decode_simple_memop(src + len, &m, &mem))
+                return 0;
+            len += mem.len;
+            a->type = ACT_CMP_RM32;
+            a->dst = m.reg;
+            a->mem_base = mem.has_base ? mem.base : -1;
+            a->mem_index = mem.has_index ? mem.index : -1;
+            a->mem_scale = mem.scale;
+            a->mem_disp = mem.disp;
+            return len;
+        }
         if (alu == ALU_CMP) {
             a->type = ACT_CMP_RR; a->dst = m.reg; a->src = m.rm;
         } else {
@@ -1011,34 +1179,81 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
      * interaction with block caching, stale translation, register save/restore,
      * or another interpreter/JIT state mismatch.
      */
-    if (op == 0x89 || op == 0x8B) {
+    if (op == 0x88 || op == 0x89 || op == 0x8A || op == 0x8B) {
         ModRM m = decode_modrm(src[len++]);
         if (!m.reg_only) {
             MemOp mem;
             if (!decode_simple_memop(src + len, &m, &mem))
                 return 0;
             len += mem.len;
-            if (op == 0x8B) {
+            if (op == 0x8A) {
+                a->type = ACT_MOV_RM8;
+                a->dst = m.reg;
+            } else if (op == 0x88) {
+                a->type = ACT_MOV_MR8;
+                a->src = m.reg;
+            } else if (op == 0x8B && opsz16) {
+                a->type = ACT_MOV_RM16;
+                a->dst = m.reg;
+            } else if (op == 0x89 && opsz16) {
+                a->type = ACT_MOV_MR16;
+                a->src = m.reg;
+            } else if (op == 0x8B) {
                 a->type = ACT_MOV_RM32;
                 a->dst = m.reg;
             } else {
                 a->type = ACT_MOV_MR32;
                 a->src = m.reg;
             }
-            a->mem_base = mem.base;
+            a->mem_base = mem.has_base ? mem.base : -1;
+            a->mem_index = mem.has_index ? mem.index : -1;
+            a->mem_scale = mem.scale;
             a->mem_disp = mem.disp;
             return len;
         }
+        if (opsz16 || op == 0x88 || op == 0x8A)
+            return 0;
         a->type = ACT_MOV_RR;
         a->dst  = (op == 0x89) ? m.rm  : m.reg;
         a->src  = (op == 0x89) ? m.reg : m.rm;
         return len;
     }
 
+    if (op == 0xA1 || op == 0xA3) {
+        int32_t disp = (int32_t)((uint32_t)src[len] |
+                                 ((uint32_t)src[len + 1] << 8) |
+                                 ((uint32_t)src[len + 2] << 16) |
+                                 ((uint32_t)src[len + 3] << 24));
+        len += 4;
+        if (op == 0xA1) {
+            a->type = ACT_MOV_RM32;
+            a->dst = 0;
+        } else {
+            a->type = ACT_MOV_MR32;
+            a->src = 0;
+        }
+        a->mem_base = -1;
+        a->mem_index = -1;
+        a->mem_disp = disp;
+        return len;
+    }
+
     /* ── TEST r/m32, r32  (85) ───────────────────────────────── */
     if (op == 0x85) {
         ModRM m = decode_modrm(src[len++]);
-        if (!m.reg_only) return 0;
+        if (!m.reg_only) {
+            MemOp mem;
+            if (!decode_simple_memop(src + len, &m, &mem))
+                return 0;
+            len += mem.len;
+            a->type = ACT_TEST_MR32;
+            a->src = m.reg;
+            a->mem_base = mem.has_base ? mem.base : -1;
+            a->mem_index = mem.has_index ? mem.index : -1;
+            a->mem_scale = mem.scale;
+            a->mem_disp = mem.disp;
+            return len;
+        }
         a->type = ACT_TEST_RR; a->dst = m.rm; a->src = m.reg;
         return len;
     }
@@ -1178,6 +1393,49 @@ typedef struct {
     int      cmp_tmp;   /* LX7 register holding (lreg - imm) for mode 2 */
 } CmpState;
 
+static void emit_mem_address(EmitPtr *p, const X86Action *a, int dst, int tmp)
+{
+    if (a->mem_base >= 0) {
+        emit_mov(p, dst, X86REG_TO_LX7(a->mem_base));
+    } else {
+        emit_movi(p, dst, 0);
+    }
+
+    if (a->mem_index >= 0) {
+        emit_mov(p, tmp, X86REG_TO_LX7(a->mem_index));
+        if (a->mem_scale != 0)
+            emit_slli(p, tmp, tmp, a->mem_scale);
+        emit_add(p, dst, dst, tmp);
+    }
+
+    if (a->mem_disp != 0 || (a->mem_base < 0 && a->mem_index < 0)) {
+        emit_movi32(p, tmp, (uint32_t)a->mem_disp);
+        emit_add(p, dst, dst, tmp);
+    }
+}
+
+static void emit_merge_u8(EmitPtr *p, int dst_reg, int value_reg, int tmp_reg, bool high)
+{
+    uint32_t clear_mask = high ? 0xffff00ffu : 0xffffff00u;
+
+    emit_movi32(p, tmp_reg, clear_mask);
+    emit_and(p, dst_reg, dst_reg, tmp_reg);
+    emit_movi32(p, tmp_reg, 0xffu);
+    emit_and(p, value_reg, value_reg, tmp_reg);
+    if (high)
+        emit_slli(p, value_reg, value_reg, 8);
+    emit_or(p, dst_reg, dst_reg, value_reg);
+}
+
+static void emit_merge_u16(EmitPtr *p, int dst_reg, int value_reg, int tmp_reg)
+{
+    emit_movi32(p, tmp_reg, 0xffff0000u);
+    emit_and(p, dst_reg, dst_reg, tmp_reg);
+    emit_movi32(p, tmp_reg, 0x0000ffffu);
+    emit_and(p, value_reg, value_reg, tmp_reg);
+    emit_or(p, dst_reg, dst_reg, value_reg);
+}
+
 /*
  * emit_action — translate one action.
  * Returns false if code buffer would overflow (host_len >= JIT_BLOCK_MAXBYTES).
@@ -1243,11 +1501,7 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     case ACT_MOV_RM32:
         GUARD(112);
         emit_store_gprs(p, cpu_reg, store_mask);
-        emit_mov(p, t0, X86REG_TO_LX7(a->mem_base));
-        if (a->mem_disp != 0) {
-            emit_movi32(p, t1, (uint32_t)a->mem_disp);
-            emit_add(p, t0, t0, t1);
-        }
+        emit_mem_address(p, a, t0, t1);
         emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_mov_rm32);
         emit_movi(p, 12, a->dst);
         emit_mov(p, 10, cpu_reg);
@@ -1258,17 +1512,80 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     case ACT_MOV_MR32:
         GUARD(112);
         emit_store_gprs(p, cpu_reg, store_mask);
-        emit_mov(p, t0, X86REG_TO_LX7(a->mem_base));
-        if (a->mem_disp != 0) {
-            emit_movi32(p, t1, (uint32_t)a->mem_disp);
-            emit_add(p, t0, t0, t1);
-        }
+        emit_mem_address(p, a, t0, t1);
         emit_mov(p, 12, sr);
         emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_mov_mr32);
         emit_mov(p, 10, cpu_reg);
         emit_callx8(p, t2);
         emit_load_gprs(p, cpu_reg, load_mask | store_mask);
         break;
+
+    case ACT_MOV_RM8: {
+        int byte_reg = a->dst & 3;
+        int host_dst = X86REG_TO_LX7(byte_reg);
+        bool high = (a->dst & 4) != 0;
+        GUARD(160);
+        emit_store_gprs(p, cpu_reg, store_mask);
+        emit_mem_address(p, a, t0, t1);
+        emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_load8);
+        emit_mov(p, 10, cpu_reg);
+        emit_callx8(p, t2);
+        emit_mov(p, t2, 10);
+        emit_load_gprs(p, cpu_reg, load_mask | store_mask);
+        emit_merge_u8(p, host_dst, t2, t1, high);
+        break;
+    }
+
+    case ACT_MOV_MR8: {
+        int byte_reg = a->src & 3;
+        int host_src = X86REG_TO_LX7(byte_reg);
+        bool high = (a->src & 4) != 0;
+        GUARD(160);
+        emit_store_gprs(p, cpu_reg, store_mask);
+        emit_mem_address(p, a, t0, t1);
+        if (high) {
+            emit_srli(p, t1, host_src, 8);
+            emit_movi32(p, t2, 0xffu);
+            emit_and(p, t1, t1, t2);
+        } else {
+            emit_movi32(p, t2, 0xffu);
+            emit_and(p, t1, host_src, t2);
+        }
+        emit_mov(p, 12, t1);
+        emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_store8);
+        emit_mov(p, 10, cpu_reg);
+        emit_callx8(p, t2);
+        emit_load_gprs(p, cpu_reg, load_mask | store_mask);
+        break;
+    }
+
+    case ACT_MOV_RM16: {
+        int host_dst = X86REG_TO_LX7(a->dst);
+        GUARD(160);
+        emit_store_gprs(p, cpu_reg, store_mask);
+        emit_mem_address(p, a, t0, t1);
+        emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_load16);
+        emit_mov(p, 10, cpu_reg);
+        emit_callx8(p, t2);
+        emit_mov(p, t2, 10);
+        emit_load_gprs(p, cpu_reg, load_mask | store_mask);
+        emit_merge_u16(p, host_dst, t2, t1);
+        break;
+    }
+
+    case ACT_MOV_MR16: {
+        GUARD(160);
+        emit_store_gprs(p, cpu_reg, store_mask);
+        emit_mem_address(p, a, t0, t1);
+        emit_movi32(p, t2, 0x0000ffffu);
+        emit_and(p, t1, sr, t2);
+        emit_mov(p, 12, t1);
+        emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_store16);
+        emit_mov(p, 10, cpu_reg);
+        emit_callx8(p, t2);
+        emit_load_gprs(p, cpu_reg, load_mask | store_mask);
+        break;
+    }
 
     /* ---- MOV ------------------------------------------------ */
     case ACT_MOV_RR:
@@ -1489,6 +1806,81 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     }
 
     /* ---- CMP / TEST ---------------------------------------- */
+    case ACT_CMP_RM32: {
+        bool fd = a->flags_dead;
+        GUARD(176);
+        emit_store_gprs(p, cpu_reg, store_mask);
+        emit_mem_address(p, a, t0, t1);
+        emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_load32);
+        emit_mov(p, 10, cpu_reg);
+        emit_callx8(p, t2);
+        emit_mov(p, t2, 10);
+        emit_load_gprs(p, cpu_reg, load_mask | store_mask);
+        emit_sub(p, t0, dr, t2);
+        cs->cmp_mode = 1;
+        cs->cmp_lreg = dr;
+        cs->cmp_rreg = t2;
+        if (!fd) {
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
+            emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t1, JIT_CC_SUB);
+            emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi32(p, t1, JIT_CC_MASK_ARITH);
+            emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        }
+        break;
+    }
+
+    case ACT_CMP_MR32: {
+        bool fd = a->flags_dead;
+        GUARD(176);
+        emit_store_gprs(p, cpu_reg, store_mask);
+        emit_mem_address(p, a, t0, t1);
+        emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_load32);
+        emit_mov(p, 10, cpu_reg);
+        emit_callx8(p, t2);
+        emit_mov(p, t2, 10);
+        emit_load_gprs(p, cpu_reg, load_mask | store_mask);
+        emit_sub(p, t0, t2, sr);
+        cs->cmp_mode = 1;
+        cs->cmp_lreg = t2;
+        cs->cmp_rreg = sr;
+        if (!fd) {
+            emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
+            emit_s32i(p, sr, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t1, JIT_CC_SUB);
+            emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi32(p, t1, JIT_CC_MASK_ARITH);
+            emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        }
+        break;
+    }
+
+    case ACT_TEST_MR32: {
+        bool fd = a->flags_dead;
+        GUARD(160);
+        emit_store_gprs(p, cpu_reg, store_mask);
+        emit_mem_address(p, a, t0, t1);
+        emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_load32);
+        emit_mov(p, 10, cpu_reg);
+        emit_callx8(p, t2);
+        emit_mov(p, t2, 10);
+        emit_load_gprs(p, cpu_reg, load_mask | store_mask);
+        emit_and(p, t0, t2, sr);
+        cs->cmp_mode = 3;
+        cs->cmp_lreg = t0;
+        if (!fd) {
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t1, JIT_CC_AND);
+            emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi32(p, t1, JIT_CC_MASK_LOGIC);
+            emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        }
+        break;
+    }
+
     case ACT_CMP_RR: {
         cs->cmp_mode  = 1;
         cs->cmp_lreg  = dr;  /* note: dr = a->dst, the left operand */
@@ -1683,7 +2075,9 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     }
     /* Clear pending CMP state after any non-branch instruction */
     if (a->type != ACT_CMP_RR && a->type != ACT_CMP_RI &&
-        a->type != ACT_TEST_RR && a->type != ACT_JCC)
+        a->type != ACT_TEST_RR && a->type != ACT_CMP_RM32 &&
+        a->type != ACT_CMP_MR32 && a->type != ACT_TEST_MR32 &&
+        a->type != ACT_JCC)
         cs->cmp_mode = 0;
 
     return true;
@@ -1749,6 +2143,70 @@ static void jit_count_bail(JITState *jit, JITBailReason reason)
         jit->bail_counts[reason]++;
 }
 
+static uint16_t jit_unsupported_key(const uint8_t *x86, uint32_t left)
+{
+    if (left >= 2u && x86[0] == 0x0f)
+        return (uint16_t)(0x100u | x86[1]);
+    return x86[0];
+}
+
+static void jit_count_unsupported_opcode(JITState *jit, const uint8_t *x86,
+                                         uint32_t left)
+{
+#if TINY386_JIT_UNSUPPORTED_HIST
+    if (left == 0)
+        return;
+    uint16_t key = jit_unsupported_key(x86, left);
+    jit->unsupported_opcode_counts[key]++;
+    jit->unsupported_opcode_total++;
+#else
+    (void)jit;
+    (void)x86;
+    (void)left;
+#endif
+}
+
+static void jit_dump_unsupported_opcodes(const JITState *jit)
+{
+#if TINY386_JIT_UNSUPPORTED_HIST
+    bool used[JIT_UNSUPPORTED_HIST_SIZE] = {0};
+    unsigned printed = 0;
+
+    if (jit->unsupported_opcode_total == 0)
+        return;
+
+    esp_rom_printf("[jit_stats] unsupported_opcode_total %u\n",
+                   (unsigned)jit->unsupported_opcode_total);
+
+    while (printed < (unsigned)TINY386_JIT_UNSUPPORTED_TOP) {
+        uint32_t best_count = 0;
+        uint16_t best_key = 0;
+
+        for (uint16_t key = 0; key < JIT_UNSUPPORTED_HIST_SIZE; key++) {
+            uint32_t count = jit->unsupported_opcode_counts[key];
+            if (!used[key] && count > best_count) {
+                best_count = count;
+                best_key = key;
+            }
+        }
+        if (best_count == 0)
+            break;
+
+        used[best_key] = true;
+        if (best_key >= 0x100u) {
+            esp_rom_printf("[jit_stats] unsupported 0f %02x %u\n",
+                           best_key & 0xffu, (unsigned)best_count);
+        } else {
+            esp_rom_printf("[jit_stats] unsupported %02x    %u\n",
+                           best_key & 0xffu, (unsigned)best_count);
+        }
+        printed++;
+    }
+#else
+    (void)jit;
+#endif
+}
+
 static void jit_dump_stats(const JITState *jit)
 {
     esp_rom_printf("[jit_stats] hits=%u misses=%u bailed=%u invalidations=%u "
@@ -1764,6 +2222,7 @@ static void jit_dump_stats(const JITState *jit)
                            (unsigned)jit->bail_counts[i]);
         }
     }
+    jit_dump_unsupported_opcodes(jit);
 }
 
 static void jit_maybe_dump_stats(JITState *jit)
@@ -1924,6 +2383,12 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
         return true;
     if (TINY386_JIT_LEVEL >= 3 &&
         (a->type == ACT_MOV_RM32 || a->type == ACT_MOV_MR32))
+        return true;
+    if (TINY386_JIT_LEVEL >= 3 &&
+        (a->type == ACT_CMP_RM32 || a->type == ACT_CMP_MR32 ||
+         a->type == ACT_TEST_MR32 || a->type == ACT_MOV_RM8 ||
+         a->type == ACT_MOV_MR8 || a->type == ACT_MOV_RM16 ||
+         a->type == ACT_MOV_MR16))
         return true;
     return false;
 }
@@ -2200,6 +2665,12 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     if (insn_count == 0) {
         jit_mark_nojit(block, paddr, paddr, scan_bail);
         jit_count_bail(jit, scan_bail);
+        if (scan_bail == JIT_BAIL_UNSUPPORTED_OPCODE ||
+            scan_bail == JIT_BAIL_UNSUPPORTED_PREFIX ||
+            scan_bail == JIT_BAIL_DISABLED) {
+            jit_count_unsupported_opcode(jit, x86 + x86_consumed,
+                                         scan_left - (uint32_t)x86_consumed);
+        }
         JIT_TRACEF("[jit_trace] translate bail paddr=0x%08x reason=%s\n",
                    (unsigned)paddr, jit_bail_reason_name(scan_bail));
         return NULL;
@@ -2214,7 +2685,9 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
         if (a->type == ACT_ALU_RR || a->type == ACT_ALU_RI ||
             a->type == ACT_CMP_RR || a->type == ACT_CMP_RI ||
-            a->type == ACT_TEST_RR || a->type == ACT_NEG_R ||
+            a->type == ACT_TEST_RR || a->type == ACT_CMP_RM32 ||
+            a->type == ACT_CMP_MR32 || a->type == ACT_TEST_MR32 ||
+            a->type == ACT_NEG_R ||
             a->type == ACT_INC_R || a->type == ACT_DEC_R ||
             a->type == ACT_SHx_RI || a->type == ACT_SHx_CL) {
             writes_flags = true;
