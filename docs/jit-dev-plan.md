@@ -866,3 +866,19 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - Task 5.2 done: prologue/epilogue now use conservative per-block GPR masks; only read GPRs are loaded and only written GPRs are stored. This preserves the existing function ABI and avoids the Task 3.4 linking blocker.
 - Task 5.3 done: enabled `XCHG EAX,r32` at level3 and added `XCHG_EAX_EBX` / `XCHG_EAX_EDI` differential selftests.
 - Verification: final selftest-only firmware on COM19 reported `96/96 PASS`; final normal firmware build flashed over COM19 and reached `Booting from 0000:7c00` and `set VGA mode 1` within a 45s capture with no WDT or panic.
+
+### Per-task Results And Notes
+
+| Task | Result | Validation | Notes |
+| --- | --- | --- | --- |
+| 3.1 JMP | Done | Added `BLOCK_JMP_REL8` and `BLOCK_JMP_REL32`; board selftest passed; normal firmware reached DOS boot path. | `TINY386_JIT_LEVEL` and `TINY386_JIT_ENABLE_JMP` are now CMake cache variables so level/gate changes can be tested without editing source. |
+| 3.2 CMP/TEST + Jcc | Done | Added 32 branch differential cases covering CMP_RR, CMP_RI, TEST_RR with taken/not-taken outcomes; board selftest passed. | Enabled supported cc set only. Unsupported or unfused conditions still fall back to interpreter rather than emitting unsafe native branches. |
+| 3.3 Branch range fallback | Done | Existing branch selftests stayed green after emitter rewrite. | Jcc now emits inverted short branch over a long `J` to the taken epilogue, avoiding oversized direct branch offsets when epilogues grow. |
+| 3.4 Direct block linking | Skipped | Not implemented. | Block entries currently include Xtensa windowed ABI `ENTRY` and return through `RETW.N`; direct jumps into another block entry would corrupt the call window/return chain. Revisit only with a separate body-entry ABI, trampoline, or link-stub design. |
+| 4.1 Cache conflict / pool full | Done | Added `CACHE_CONFLICT` and `CACHE_POOL_FULL`; final selftest included both in `96/96 PASS`. | Selftest wrappers expose pool epoch and forced pool usage only for ESP32 JIT test builds. |
+| 4.2 CR3 / paging / code-size invalidation | Done | Added `STATE_CR3_INVALIDATE`; final selftest included it in `96/96 PASS`. | Hooks invalidate all JIT blocks on CR0 paging/WP/PE changes, CR3 writes, task-switch CR3 load, and CS code16/code32 changes. |
+| 4.3 Store-triggered SMC invalidation | Done | Covered by SMC overlap selftest; final selftest included it in `96/96 PASS`. | Store hooks run after non-MMIO guest RAM `pstore8/16/32`, including split writes. MMIO writes are left to device callbacks. |
+| 4.4 Precise range invalidation | Done | Added `SMC_RANGE_NONOVERLAP` and `SMC_RANGE_OVERLAP`; final selftest included both in `96/96 PASS`. | Added `jit_invalidate_range()` plus a hashed translated-code page bitmap. First naive store-scan path slowed boot badly; bitmap filter restored normal boot speed. |
+| 5.1 Performance baseline | Done | Captured COM19 level3 and temporary level0 45s boot windows; both reached `set VGA mode 1`. | Representative level3 samples: about `550889 ips` at 5.9s, `1044520 ips` at 10.9s, `875941 ips` at 20.9s. Level0 was similar in this workload, so current coverage is not yet hitting the dominant DOS hot path. |
+| 5.2 Minimal GPR load/store | Done | Final selftest `96/96 PASS`; final normal firmware reached `set VGA mode 1`. | Prologue loads only read GPRs; epilogue stores only written GPRs. This keeps the existing function ABI and avoids the Task 3.4 direct-linking blocker. |
+| 5.3 Opcode coverage | Done | Added `XCHG_EAX_EBX` and `XCHG_EAX_EDI`; final selftest `96/96 PASS`; final normal firmware reached `set VGA mode 1`. | Runtime gate now enables `XCHG EAX,r32` at level3. Next useful candidates should come from bail/hot-path stats rather than guessing. |
