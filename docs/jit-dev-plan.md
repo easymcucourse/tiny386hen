@@ -770,11 +770,11 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
   WDT/panic。
 
 #### Task 3.4 — 直接块链接（direct block linking）
-- **目标**：fallthrough/taken 直接跳到已编译的下一块入口，减少回 C 与 prologue/epilogue 开销。
-- **范围(≈2h)**：块记录出口 patch 点；命中目标块时回填 host 直跳；CR3/flush 时清链接。
-- **涉及文件**：`jit_x86.h`（通用 `JITBlock` 链接元数据），`jit_lx7.c`（LX7 patch 点与回填实现）。
-- **验收**：自检仍 PASS；P5 基准显示开销下降。
-- **备注**：DOSBox-X dynrec 的链接思路可参考（仅设计参考，不拷贝代码）。
+- **目标**：在不破坏 Xtensa windowed ABI 的前提下，让已缓存的 fallthrough 后继块可由源块出口直接串接，减少一次回 C 调度。
+- **范围(≈2h)**：块记录链接目标元数据；命中已编译 fallthrough 目标块时发射 `CALL8` link-stub；SMC、CR3/flush、cache 冲突或目标块替换时清理链接源块。
+- **涉及文件**：`jit_x86.h`（通用 `JITBlock` 链接元数据），`jit_lx7.c`（LX7 `CALL8` link-stub 与失效实现），`jit_selftest.c`（链接差分自检）。
+- **验收**：板上 selftest 仍 PASS，新增 fallthrough 链接用例；正常主程序启动冒烟无 WDT/panic。
+- **备注**：不能 raw `J` 到另一个 block 的函数入口；当前保守方案使用 `CALL8` 保持 windowed ABI 正确。DOSBox-X dynrec 的链接思路可参考（仅设计参考，不拷贝代码）。
 - **执行结果（2026-07-01 / COM19 retry）**：✅ 已完成保守第一阶段。确认原始 `J` 到
   另一个 block 入口仍会破坏 Xtensa windowed ABI，因此改用 link-stub：fallthrough 目标块已在
   cache 中时，源块出口先回写 dirty GPR，将 `CPUI386*` 从当前窗口 `a2` 放入 outgoing arg0
