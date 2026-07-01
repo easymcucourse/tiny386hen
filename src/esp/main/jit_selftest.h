@@ -30,6 +30,7 @@ int jit_cpu_step_interp(CPUI386 *cpu, int stepcount);
 int jit_cpu_step_jit(CPUI386 *cpu, int max_insns);
 void jit_cpu_prepare_exec(CPUI386 *cpu, uint32_t ip);
 void jit_cpu_invalidate_cache(CPUI386 *cpu);
+bool jit_cpu_translate_current(CPUI386 *cpu);
 
 #endif /* BUILD_ESP32 && TINY386_ENABLE_JIT */
 

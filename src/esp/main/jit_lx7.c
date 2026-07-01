@@ -80,6 +80,8 @@ static uint8_t *s_jit_pool_exec;
 static bool     s_jit_pool_psram;
 static bool     s_jit_pool_tried;
 
+#define JIT_LINK_NONE 0xffffu
+
 static uint8_t *jit_pool_exec_for(const uint8_t *write_ptr)
 {
     if (!write_ptr)
@@ -425,6 +427,35 @@ static inline void emit_j_target(EmitPtr *p, const uint8_t *target)
     emit_j(p, (int32_t)(target - (pc + 4)));
 }
 
+static inline bool call8_target_reachable(const uint8_t *pc, const uint8_t *target)
+{
+    intptr_t base = ((intptr_t)pc + 4) & ~(intptr_t)3;
+    intptr_t delta = (intptr_t)target - base;
+
+    if ((delta & 3) != 0)
+        return false;
+
+    int32_t off = (int32_t)(delta >> 2);
+    return off >= -131072 && off <= 131071;
+}
+
+static inline bool emit_call8_target(EmitPtr *p, const uint8_t *target)
+{
+    const uint8_t *pc = *p;
+    intptr_t base = ((intptr_t)pc + 4) & ~(intptr_t)3;
+    int32_t off = (int32_t)(((intptr_t)target - base) >> 2);
+
+    if (!call8_target_reachable(pc, target))
+        return false;
+
+    uint32_t enc = ((uint32_t)off & 0x3ffffu) << 6 | 0x25u;
+    (*p)[0] = (uint8_t)(enc & 0xff);
+    (*p)[1] = (uint8_t)((enc >> 8) & 0xff);
+    (*p)[2] = (uint8_t)((enc >> 16) & 0xff);
+    *p += 3;
+    return true;
+}
+
 /* SRLI for shift amounts 16-31 (uses MOVI + SSR + SRL, 9 bytes) */
 static void emit_ssri_wide(EmitPtr *p, int r, int sa)
 {
@@ -561,6 +592,42 @@ static void emit_epilogue(EmitPtr *p, int cpu_reg, uint32_t next_ip, uint8_t sto
     emit_movi32(p, LX7_TMP0, next_ip);
     emit_s32i(p, LX7_TMP0, cpu_reg, NEXT_IP_OFF / 4);
     emit_retw(p);
+}
+
+static bool emit_linked_exit(EmitPtr *p, const uint8_t *code_end, int cpu_reg,
+                             const JITBlock *target, uint8_t store_mask)
+{
+    int store_count = 0;
+
+    if (!target || target->status != JIT_VALID || !target->host_code)
+        return false;
+    if ((target->flags & JIT_BLOCKF_LINKED_EXIT) != 0)
+        return false;
+    if (*p + 40 >= code_end)
+        return false;
+
+    for (int i = 0; i < 8; i++) {
+        if (store_mask & (1u << i))
+            store_count++;
+    }
+    if (!call8_target_reachable(*p + store_count * 3 + 2, target->host_code))
+        return false;
+
+    for (int i = 0; i < 8; i++) {
+        if (!(store_mask & (1u << i)))
+            continue;
+        emit_s32i(p, LX7_GPR_BASE + i, cpu_reg, GPR_OFF(i) / 4);
+    }
+
+    /*
+     * CALL8 rotates the register window; callee a2 is caller a10.
+     * Preserve the normal C ABI shape by putting CPUI386* in outgoing arg0.
+     */
+    emit_mov(p, 10, cpu_reg);
+    if (!emit_call8_target(p, target->host_code))
+        return false;
+    emit_retw(p);
+    return true;
 }
 
 /* ================================================================== */
@@ -1515,7 +1582,10 @@ static void jit_mark_nojit(JITBlock *block, uint32_t paddr, uint32_t guest_end,
 {
     block->guest_paddr = paddr;
     block->guest_end   = guest_end;
+    block->link_x86_insns = 0;
     block->flags       = JIT_BLOCKF_STICKY_NOJIT;
+    block->link_slot   = JIT_LINK_NONE;
+    block->link_paddr  = 0;
     block->exit_kind   = JIT_EXIT_INTERPRETER;
 #if TINY386_JIT_BAIL_REASONS
     block->bail        = bail;
@@ -1609,6 +1679,21 @@ static JITExitKind jit_exit_kind_for_actions(const X86Action *actions, int count
     default:
         return JIT_EXIT_FALLTHROUGH;
     }
+}
+
+static JITBlock *jit_find_link_target(JITState *jit, uint32_t paddr,
+                                      uint16_t *slot_out)
+{
+    uint16_t slot = (uint16_t)jit_hash(paddr);
+    JITBlock *target = &jit->blocks[slot];
+
+    if (target->status != JIT_VALID || target->guest_paddr != paddr)
+        return NULL;
+    if ((target->flags & JIT_BLOCKF_LINKED_EXIT) != 0)
+        return NULL;
+    if (slot_out)
+        *slot_out = slot;
+    return target;
 }
 
 static bool jit_action_ends_block(const X86Action *a)
@@ -1763,6 +1848,29 @@ void jit_invalidate_all(JITState *jit)
     memset(jit->smc_page_bitmap, 0, sizeof(jit->smc_page_bitmap));
 }
 
+static void jit_invalidate_slot_and_links(JITState *jit, uint16_t slot)
+{
+    if (slot >= JIT_CACHE_ENTRIES)
+        return;
+
+    JITBlock *victim = &jit->blocks[slot];
+    if (victim->status == JIT_VALID) {
+        victim->status = JIT_EMPTY;
+        jit->invalidations++;
+    }
+
+    for (uint16_t i = 0; i < JIT_CACHE_ENTRIES; i++) {
+        JITBlock *block = &jit->blocks[i];
+        if (block->status != JIT_VALID)
+            continue;
+        if ((block->flags & JIT_BLOCKF_LINKED_EXIT) != 0 &&
+            block->link_slot == slot) {
+            block->status = JIT_EMPTY;
+            jit->invalidations++;
+        }
+    }
+}
+
 static inline uint32_t jit_smc_page_bit(uint32_t paddr)
 {
     return (paddr >> 12) & (JIT_SMC_PAGE_BITS - 1u);
@@ -1808,10 +1916,8 @@ void jit_invalidate_range(JITState *jit, uint32_t paddr, uint32_t size)
         if (block->status != JIT_VALID)
             continue;
 
-        if (block->guest_paddr < range_end && block->guest_end > paddr) {
-            block->status = JIT_EMPTY;
-            jit->invalidations++;
-        }
+        if (block->guest_paddr < range_end && block->guest_end > paddr)
+            jit_invalidate_slot_and_links(jit, (uint16_t)i);
     }
 }
 
@@ -1878,7 +1984,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
     /* Evict the old entry if occupied by a different address */
     if (block->status == JIT_VALID && block->guest_paddr != paddr)
-        block->status = JIT_EMPTY;
+        jit_invalidate_slot_and_links(jit, (uint16_t)slot);
 
     /* Allocate space in the code pool */
     jit->pool_used = jit_align4(jit->pool_used);
@@ -2006,6 +2112,8 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     bool     ok   = true;
     uint16_t block_flags = JIT_BLOCKF_NONE;
     bool     ended_block = false;
+    JITBlock *link_target = NULL;
+    uint16_t  link_slot = JIT_LINK_NONE;
     cur_eip = eip;
     jit_actions_reg_masks(actions, insn_count, &load_mask, &store_mask);
     emit_prologue(&p, LX7_CPU_REG, load_mask);
@@ -2036,10 +2144,17 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     }
 
     if (ok && !ended_block) {
-        if (p + 80 < code_end)
+        link_target = jit_find_link_target(jit, cs_base + cur_eip, &link_slot);
+        if (link_target &&
+            emit_linked_exit(&p, code_end, LX7_CPU_REG, link_target, store_mask)) {
+            block_flags |= JIT_BLOCKF_LINKED_EXIT;
+        } else if (p + 80 < code_end) {
+            link_target = NULL;
+            link_slot = JIT_LINK_NONE;
             emit_epilogue(&p, LX7_CPU_REG, cur_eip, store_mask);
-        else
+        } else {
             ok = false;
+        }
     }
 
     if (!ok || p >= code_end) {
@@ -2068,7 +2183,10 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     block->host_len     = (uint16_t)(p - code_start);
     block->x86_len      = (uint16_t)emitted_bytes;
     block->x86_insns    = (uint16_t)emitted_insns;
+    block->link_x86_insns = link_target ? link_target->x86_insns : 0;
     block->flags        = block_flags | jit_block_flags_for_actions(actions, emitted_insns);
+    block->link_slot    = link_target ? link_slot : JIT_LINK_NONE;
+    block->link_paddr   = link_target ? link_target->guest_paddr : 0;
     block->exit_kind    = jit_exit_kind_for_actions(actions, emitted_insns);
     block->bail         = JIT_BAIL_NONE;
     block->status       = JIT_VALID;
@@ -2146,5 +2264,5 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     JIT_TRACEF("[jit_trace] done host=%p next_ip=0x%08x\n",
                (void *)fn, (unsigned)cpui386_get_next_ip(cpu));
     jit_maybe_dump_stats(jit);
-    return block->x86_insns;
+    return (int)block->x86_insns + (int)block->link_x86_insns;
 }

@@ -5627,6 +5627,11 @@ void jit_cpu_invalidate_cache(CPUI386 *cpu)
 	jit_invalidate_all(&cpu->jit);
 }
 
+bool jit_cpu_translate_current(CPUI386 *cpu)
+{
+	return jit_translate(&cpu->jit, cpu) != NULL;
+}
+
 uint32_t jit_selftest_get_pool_epoch(CPUI386 *cpu)
 {
 	return cpu->jit.pool_epoch;

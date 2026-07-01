@@ -75,12 +75,16 @@
  * Set to 1 for board JIT differential self-test only: skips LCD, I2S, SD, USB,
  * and the PC emulator. Serial output uses esp_rom_printf (UART0).
  */
+#ifndef TINY386_JIT_SELFTEST_ONLY
 #define TINY386_JIT_SELFTEST_ONLY 0
+#endif
 
 /*
  * Run jit_selftest at i386_task entry (production boot path, no LCD/I2S/USB/SD).
  */
+#ifndef TINY386_JIT_SELFTEST_AT_BOOT
 #define TINY386_JIT_SELFTEST_AT_BOOT 0
+#endif
 
 /*
  * 2:1 downscale rendering so that VGA 80-column text mode (640×400 pixels

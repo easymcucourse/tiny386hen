@@ -224,6 +224,7 @@ typedef enum {
     JIT_BLOCKF_ENDS_JCC      = 1u << 2,
     JIT_BLOCKF_PARTIAL       = 1u << 3, /* Emitted a safe prefix of a block. */
     JIT_BLOCKF_STICKY_NOJIT  = 1u << 4, /* Repeated attempts should bail fast. */
+    JIT_BLOCKF_LINKED_EXIT   = 1u << 5, /* Exit calls a cached successor block. */
 } JITBlockFlags;
 
 typedef struct {
@@ -244,7 +245,10 @@ typedef struct {
     uint16_t      host_len;      /* Bytes of generated host code. */
     uint16_t      x86_len;       /* Bytes consumed in x86 stream. */
     uint16_t      x86_insns;     /* Guest instructions consumed. */
+    uint16_t      link_x86_insns;/* Additional insns executed by linked exit. */
     uint16_t      flags;         /* JITBlockFlags bitset. */
+    uint16_t      link_slot;     /* Linked successor slot, 0xffff = none. */
+    uint32_t      link_paddr;    /* Linked successor physical entry address. */
     JITExitKind   exit_kind;     /* Expected normal exit path. */
     JITBailReason bail;          /* Reason when status == JIT_NOJIT. */
     JITStatus     status;

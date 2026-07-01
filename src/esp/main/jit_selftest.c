@@ -137,6 +137,10 @@ static const uint8_t code_mov_eax_nop_mov_ebx[] = {
 	0x90,
 	0xBB, 0x00, 0x00, 0x00, 0x80,
 };
+static const uint8_t code_link_mov_eax_nop[] = {
+	0xB8, 0x78, 0x56, 0x34, 0x12,
+	0x90,
+};
 static const uint8_t code_block_mov_chain[] = {
 	0xB8, 0x78, 0x56, 0x34, 0x12, /* mov eax,0x12345678 */
 	0x8B, 0xD8,                   /* mov ebx,eax */
@@ -673,6 +677,64 @@ static bool run_block_case(CPUI386 *cpu, uint8_t *mem, const SelftestCase *tc,
 
 	esp_rom_printf("[jit_selftest] PASS %s_block (interp=%d jit=%d)\n",
 		       tc->name, interp_steps, jit_steps);
+	return true;
+}
+
+static bool run_linked_exit_case(CPUI386 *cpu, uint8_t *mem)
+{
+	static const SelftestCase tc = {
+		.name = "LINK_FALLTHROUGH_MOV_EAX_NOP",
+		.code = code_link_mov_eax_nop,
+		.code_len = sizeof(code_link_mov_eax_nop),
+		.jit_allow = JIT_ST_ALLOW(ACT_MOV_RI),
+		.init = init_mov_eax_state,
+	};
+	JITCpuSnapshot baseline;
+	JITCpuSnapshot interp_result;
+	JITCpuSnapshot jit_result;
+	int interp_steps;
+	int jit_steps;
+
+	setup_cpu(cpu, mem, &tc);
+	jit_cpu_snapshot(cpu, &baseline);
+
+	jit_cpu_restore(cpu, &baseline);
+	interp_steps = jit_cpu_step_interp(cpu, 2);
+	jit_cpu_snapshot(cpu, &interp_result);
+
+	jit_cpu_invalidate_cache(cpu);
+	jit_cpu_restore(cpu, &baseline);
+
+	jit_selftest_set_allowed_actions(JIT_ST_ALLOW(ACT_NOP));
+	jit_cpu_prepare_exec(cpu, ST_CODE_BASE + 5);
+	if (!jit_cpu_translate_current(cpu)) {
+		jit_selftest_clear_allowed_actions();
+		esp_rom_printf("[jit_selftest] FAIL %s_link: target translate failed\n",
+			       tc.name);
+		return false;
+	}
+
+	jit_selftest_set_allowed_actions(tc.jit_allow);
+	jit_cpu_prepare_exec(cpu, ST_CODE_BASE);
+	jit_steps = jit_cpu_step_jit(cpu, 2);
+	jit_selftest_clear_allowed_actions();
+	jit_cpu_snapshot(cpu, &jit_result);
+
+	if (interp_steps != 2) {
+		esp_rom_printf("[jit_selftest] FAIL %s_link: interpreter steps %d != 2\n",
+			       tc.name, interp_steps);
+		return false;
+	}
+	if (jit_steps != 2) {
+		esp_rom_printf("[jit_selftest] FAIL %s_link: JIT steps %d != 2\n",
+			       tc.name, jit_steps);
+		return false;
+	}
+	if (!compare_snapshots(tc.name, &interp_result, &jit_result))
+		return false;
+
+	esp_rom_printf("[jit_selftest] PASS %s_link (interp=%d jit=%d)\n",
+		       tc.name, interp_steps, jit_steps);
 	return true;
 }
 
@@ -1248,7 +1310,8 @@ int jit_selftest_run(void)
 	const unsigned cache_count = 2u;
 	const unsigned state_count = 1u;
 	const unsigned smc_count = 2u;
-	const unsigned check_count = case_count + mixed_count + block_count + alu_count + shift_count + branch_count + cache_count + state_count + smc_count + 1u;
+	const unsigned link_count = 1u;
+	const unsigned check_count = case_count + mixed_count + block_count + alu_count + shift_count + branch_count + cache_count + state_count + smc_count + link_count + 1u;
 	uint8_t *mem;
 	CPUI386 *cpu;
 	int failures = 0;
@@ -1258,8 +1321,8 @@ int jit_selftest_run(void)
 		return 1;
 	}
 
-	esp_rom_printf("[jit_selftest] start (%u cases + %u mixed + %u block + %u alu + %u shift + %u branch + %u cache + %u state + %u smc + flash probe)\n",
-		       case_count, mixed_count, block_count, alu_count, shift_count, branch_count, cache_count, state_count, smc_count);
+	esp_rom_printf("[jit_selftest] start (%u cases + %u mixed + %u block + %u alu + %u shift + %u branch + %u cache + %u state + %u smc + %u link + flash probe)\n",
+		       case_count, mixed_count, block_count, alu_count, shift_count, branch_count, cache_count, state_count, smc_count, link_count);
 
 	flash_before_ok = read_flash_probe("before_jit", &flash_before);
 	if (!flash_before_ok)
@@ -1314,6 +1377,8 @@ int jit_selftest_run(void)
 		failures += (int)state_count;
 	if (!run_smc_invalidation_cases(cpu, mem))
 		failures += (int)smc_count;
+	if (!run_linked_exit_case(cpu, mem))
+		failures += (int)link_count;
 
 	if (flash_before_ok) {
 		if (!read_flash_probe("after_jit", &flash_after) ||

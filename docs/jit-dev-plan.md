@@ -775,11 +775,15 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **涉及文件**：`jit_x86.h`（通用 `JITBlock` 链接元数据），`jit_lx7.c`（LX7 patch 点与回填实现）。
 - **验收**：自检仍 PASS；P5 基准显示开销下降。
 - **备注**：DOSBox-X dynrec 的链接思路可参考（仅设计参考，不拷贝代码）。
-- **执行结果（2026-07-01 / COM19）**：⏭️ 已跳过并记录阻塞原因。当前每个 JIT block
-  都是完整 Xtensa windowed ABI 函数，入口包含 `ENTRY a1,32`，出口通过 `RETW.N` 返回；
-  若直接 `J` 到另一个 block 入口，会再次执行 `ENTRY` 并破坏 call window / return chain。
-  后续若要重试，需要先设计独立 body-entry ABI、trampoline 或 link-stub，不能在现有入口
-  之间直接相跳。该跳过不影响 P4/P5 后续任务执行。
+- **执行结果（2026-07-01 / COM19 retry）**：✅ 已完成保守第一阶段。确认原始 `J` 到
+  另一个 block 入口仍会破坏 Xtensa windowed ABI，因此改用 link-stub：fallthrough 目标块已在
+  cache 中时，源块出口先回写 dirty GPR，将 `CPUI386*` 从当前窗口 `a2` 放入 outgoing arg0
+  `a10`，再 `CALL8` 到目标 block，目标 `RETW.N` 返回源块后源块再 `RETW.N` 回 C。
+  新增 `JIT_BLOCKF_LINKED_EXIT`、`link_slot/link_paddr/link_x86_insns` 元数据，并在目标块
+  被 SMC/冲突替换失效时同步失效链接源块。新增 `LINK_FALLTHROUGH_MOV_EAX_NOP` 自检，
+  COM19 selftest-only 结果 `97/97 PASS`；正常主程序回刷后 45 秒启动冒烟无 WDT/panic，
+  到达 `Booting from 0000:7c00` 与 `set VGA mode 1`。taken Jcc 与未命中目标的后续
+  patch 回填仍留作后续扩展。
 
 ---
 
@@ -917,15 +921,15 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - Task 3.1 done: enabled `ACT_JMP` with `TINY386_JIT_LEVEL=3` / `TINY386_JIT_ENABLE_JMP=1`; added rel8/rel32 JMP selftests; board selftest and normal firmware smoke passed.
 - Task 3.2 done: enabled CMP_RR/CMP_RI/TEST_RR + Jcc fusion for supported cc set; added 32 taken/not-taken branch selftests; board selftest passed.
 - Task 3.3 done: changed Jcc emission to range-safe inverted short branch plus long `J` to the taken epilogue; unsupported conditions bail before emitting partial branch bytes.
-- Task 3.4 skipped for now: current JIT blocks are full Xtensa windowed ABI functions (`ENTRY` + `RETW.N`). Directly jumping into another block entry would nest/corrupt the call window and return chain. Revisit only after introducing a separate body-entry ABI or a trampoline/link stub model.
+- Task 3.4 retry done: implemented a conservative fallthrough link-stub for already-cached successor blocks. Raw `J` between block entries remains unsafe with Xtensa windowed ABI, so the emitted linked exit uses `CALL8` with `CPUI386*` moved into outgoing arg0 (`a10`), then returns to C after the successor returns. Target invalidation also invalidates linked sources. Board selftest added `LINK_FALLTHROUGH_MOV_EAX_NOP` and passed `97/97`.
 - Task 4.1 done: verified cache slot conflict and pool-full flush paths with board selftests (`CACHE_CONFLICT`, `CACHE_POOL_FULL`).
 - Task 4.2 done: invalidates all JIT blocks on CR0 paging/WP/PE changes, CR3 writes, task-switch CR3 load, and CS code16/code32 transitions; selftest covers real interpreter `MOV CR3,EAX` invalidation.
 - Task 4.3 done: guest RAM stores now call JIT SMC invalidation after `pstore8/16/32` on non-MMIO physical writes, including split writes.
 - Task 4.4 done: added `jit_invalidate_range()` and a hashed translated-code page bitmap so normal data writes avoid scanning the JIT cache; selftests prove same-page non-overlap writes do not invalidate, overlap writes do invalidate and retranslate modified code.
 - Task 5.1 done: captured COM19 perf baseline with JIT level3 and temporary level0. In this boot window both reached `set VGA mode 1`; representative level3 samples were `ips=550889` at about 5.9s, `ips=1044520` at about 10.9s, and `ips=875941` at about 20.9s. Level0 samples were effectively similar for this workload, indicating current opcode coverage still misses the dominant DOS hot path.
-- Task 5.2 done: prologue/epilogue now use conservative per-block GPR masks; only read GPRs are loaded and only written GPRs are stored. This preserves the existing function ABI and avoids the Task 3.4 linking blocker.
+- Task 5.2 done: prologue/epilogue now use conservative per-block GPR masks; only read GPRs are loaded and only written GPRs are stored. This preserves the existing function ABI and remains compatible with the Task 3.4 `CALL8` link-stub.
 - Task 5.3 done: enabled `XCHG EAX,r32` at level3 and added `XCHG_EAX_EBX` / `XCHG_EAX_EDI` differential selftests.
-- Verification: final selftest-only firmware on COM19 reported `96/96 PASS`; final normal firmware build flashed over COM19 and reached `Booting from 0000:7c00` and `set VGA mode 1` within a 45s capture with no WDT or panic.
+- Verification: final selftest-only firmware on COM19 reported `97/97 PASS`; final normal firmware build flashed over COM19 and reached `Booting from 0000:7c00` and `set VGA mode 1` within a 45s capture with no WDT or panic.
 
 ### Per-task Results And Notes
 
@@ -934,11 +938,11 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 | 3.1 JMP | Done | Added `BLOCK_JMP_REL8` and `BLOCK_JMP_REL32`; board selftest passed; normal firmware reached DOS boot path. | `TINY386_JIT_LEVEL` and `TINY386_JIT_ENABLE_JMP` are now CMake cache variables so level/gate changes can be tested without editing source. |
 | 3.2 CMP/TEST + Jcc | Done | Added 32 branch differential cases covering CMP_RR, CMP_RI, TEST_RR with taken/not-taken outcomes; board selftest passed. | Enabled supported cc set only. Unsupported or unfused conditions still fall back to interpreter rather than emitting unsafe native branches. |
 | 3.3 Branch range fallback | Done | Existing branch selftests stayed green after emitter rewrite. | Jcc now emits inverted short branch over a long `J` to the taken epilogue, avoiding oversized direct branch offsets when epilogues grow. |
-| 3.4 Direct block linking | Skipped | Not implemented. | Block entries currently include Xtensa windowed ABI `ENTRY` and return through `RETW.N`; direct jumps into another block entry would corrupt the call window/return chain. Revisit only with a separate body-entry ABI, trampoline, or link-stub design. |
+| 3.4 Direct block linking | Done, conservative first slice | Added `LINK_FALLTHROUGH_MOV_EAX_NOP`; final selftest `97/97 PASS`; normal firmware reached `Booting from 0000:7c00` and `set VGA mode 1`. | Uses `CALL8` link-stub for already-cached fallthrough successors instead of raw `J` between block entries; target invalidation clears linked sources. Taken Jcc and unresolved-exit patching remain future work. |
 | 4.1 Cache conflict / pool full | Done | Added `CACHE_CONFLICT` and `CACHE_POOL_FULL`; final selftest included both in `96/96 PASS`. | Selftest wrappers expose pool epoch and forced pool usage only for ESP32 JIT test builds. |
 | 4.2 CR3 / paging / code-size invalidation | Done | Added `STATE_CR3_INVALIDATE`; final selftest included it in `96/96 PASS`. | Hooks invalidate all JIT blocks on CR0 paging/WP/PE changes, CR3 writes, task-switch CR3 load, and CS code16/code32 changes. |
 | 4.3 Store-triggered SMC invalidation | Done | Covered by SMC overlap selftest; final selftest included it in `96/96 PASS`. | Store hooks run after non-MMIO guest RAM `pstore8/16/32`, including split writes. MMIO writes are left to device callbacks. |
 | 4.4 Precise range invalidation | Done | Added `SMC_RANGE_NONOVERLAP` and `SMC_RANGE_OVERLAP`; final selftest included both in `96/96 PASS`. | Added `jit_invalidate_range()` plus a hashed translated-code page bitmap. First naive store-scan path slowed boot badly; bitmap filter restored normal boot speed. |
 | 5.1 Performance baseline | Done | Captured COM19 level3 and temporary level0 45s boot windows; both reached `set VGA mode 1`. | Representative level3 samples: about `550889 ips` at 5.9s, `1044520 ips` at 10.9s, `875941 ips` at 20.9s. Level0 was similar in this workload, so current coverage is not yet hitting the dominant DOS hot path. |
-| 5.2 Minimal GPR load/store | Done | Final selftest `96/96 PASS`; final normal firmware reached `set VGA mode 1`. | Prologue loads only read GPRs; epilogue stores only written GPRs. This keeps the existing function ABI and avoids the Task 3.4 direct-linking blocker. |
+| 5.2 Minimal GPR load/store | Done | Final selftest `96/96 PASS`; final normal firmware reached `set VGA mode 1`. | Prologue loads only read GPRs; epilogue stores only written GPRs. This keeps the existing function ABI and is compatible with the Task 3.4 `CALL8` link-stub. |
 | 5.3 Opcode coverage | Done | Added `XCHG_EAX_EBX` and `XCHG_EAX_EDI`; final selftest `96/96 PASS`; final normal firmware reached `set VGA mode 1`. | Runtime gate now enables `XCHG EAX,r32` at level3. Next useful candidates should come from bail/hot-path stats rather than guessing. |
