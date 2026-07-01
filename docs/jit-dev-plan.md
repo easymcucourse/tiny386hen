@@ -741,17 +741,33 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **目标**：解决历史 JMP WDT（relocation 阶段）。
 - **范围(≈2h)**：epilogue 写 `next_ip=target_eip` 返回 C 即可（无需 host J）；trace 首批 JMP，比对 target；放开 `ACT_JMP`，`TINY386_JIT_LEVEL=3`。
 - **验收**：JMP 自检 PASS；relocation 阶段不再 WDT；启动通过。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。将 `TINY386_JIT_LEVEL` 和
+  `TINY386_JIT_ENABLE_JMP` 改为 CMake cache 变量，默认 level3 且打开 JMP gate。新增
+  `BLOCK_JMP_REL8` 与 `BLOCK_JMP_REL32` 自检，覆盖 rel8/rel32 块边界跳转，JIT 通过写
+  `next_ip=target_eip` 返回 C 调度，不做 host 直跳。COM19 selftest-only 通过，切回正常
+  主程序后 app-flash 成功，启动冒烟无 WDT/panic，到达 `Booting from 0000:7c00` 与
+  `set VGA mode 1`。
 
 #### Task 3.2 — CMP/TEST + Jcc 融合逐条件验证
 - **目标**：16 个条件码（Z/NZ/B/NB/BE/NBE/L/NL/LE/NLE/S/NS/O/NO/P/NP）的融合分支正确。
 - **范围(≈2h)**：自检对每个 cc 用 CMP_RR/CMP_RI/TEST_RR 三种来源各构造 taken/not-taken；比较 next_ip。
 - **涉及文件**：`jit_selftest.c`，`jit_lx7.c`（补全/修正未支持的 cc，如 O/NO/P/NP 目前 `return false` 回退）。
 - **验收**：所有支持的 cc 自检 PASS，不支持的安全回退解释器（不发散）。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成支持子集。新增 CMP_RR、CMP_RI、
+  TEST_RR 到 Jcc 的分支差分自检 32 例，覆盖 Z/NZ/B/NB/BE/NBE/L/NL/LE/NLE/S/NS 的
+  taken/not-taken 路径。`jit_action_enabled()` 在 level3 放开 `ACT_CMP_RR`、
+  `ACT_CMP_RI`、`ACT_TEST_RR`、`ACT_JCC`；未支持或无法融合的条件仍 `return false`
+  安全回退解释器。COM19 selftest-only 通过，正常主程序启动冒烟无 WDT/panic。
 
 #### Task 3.3 — 分支回填范围与降级
 - **目标**：LX7 `BEQ/...` 偏移是有符号 8 位、`BEQZ/...` 是 12 位；epilogue 较大时可能溢出。
 - **范围(≈2h)**：检测 `br_off` 超范围时改用"短分支跳过一个 J/长跳"或回退；自检构造大 epilogue 触发。
 - **验收**：构造的超范围用例不产生坏跳转（PASS 或安全回退）。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。Jcc emitter 改为“反向短分支跳过
+  long `J`，再由 long `J` 跳到 taken epilogue”的结构，避免 epilogue 增长后直接短分支
+  偏移溢出。补充了发射前 supported 条件检查， unsupported cc 在写入 placeholder 前即
+  回退，避免生成半截坏块。原有 32 个分支自检保持 PASS，正常主程序启动冒烟无
+  WDT/panic。
 
 #### Task 3.4 — 直接块链接（direct block linking）
 - **目标**：fallthrough/taken 直接跳到已编译的下一块入口，减少回 C 与 prologue/epilogue 开销。
@@ -759,6 +775,11 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **涉及文件**：`jit_x86.h`（通用 `JITBlock` 链接元数据），`jit_lx7.c`（LX7 patch 点与回填实现）。
 - **验收**：自检仍 PASS；P5 基准显示开销下降。
 - **备注**：DOSBox-X dynrec 的链接思路可参考（仅设计参考，不拷贝代码）。
+- **执行结果（2026-07-01 / COM19）**：⏭️ 已跳过并记录阻塞原因。当前每个 JIT block
+  都是完整 Xtensa windowed ABI 函数，入口包含 `ENTRY a1,32`，出口通过 `RETW.N` 返回；
+  若直接 `J` 到另一个 block 入口，会再次执行 `ENTRY` 并破坏 call window / return chain。
+  后续若要重试，需要先设计独立 body-entry ABI、trampoline 或 link-stub，不能在现有入口
+  之间直接相跳。该跳过不影响 P4/P5 后续任务执行。
 
 ---
 
@@ -768,12 +789,22 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **目标**：哈希冲突逐出、`guest_paddr` 校验、pool 满 `jit_invalidate_all` 路径正确。
 - **范围(≈2h)**：自检构造同槽不同地址、pool 逼近满；验证不执行到陌生块。
 - **验收**：构造用例下无错误命中、无越界。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。确认现有 `jit_translate()` 已在同槽
+  不同 `guest_paddr` 时清空旧 slot，pool 空间不足时调用 `jit_invalidate_all()`。新增
+  selftest-only wrapper 读取 `pool_epoch` 并强制设置 `pool_used`，构造 `CACHE_CONFLICT`
+  与 `CACHE_POOL_FULL` 两个用例。COM19 selftest-only 中两项均 PASS，最终汇总纳入
+  `96/96 PASS`。
 
 #### Task 4.2 — CR3 / 分页模式切换失效
 - **目标**：写 CR3、切 CR0.PG、切换 code16/32 时 `jit_invalidate_all`。
 - **范围(≈2h)**：在 `i386.c` 写 CR3/CR0 的位置调用失效；自检模拟切换后不复用旧块。
 - **涉及文件**：`i386.c`（MOV CR 处），`jit_lx7.c`。
 - **验收**：切换后旧块不被执行；启动/重启动稳定。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。新增 `jit_state_change_invalidate()`
+  helper，并在 `MOV CR0` 的 PG/WP/PE 变化、`MOV CR3`、task switch 读取新 CR3、以及
+  `set_seg()` 中 CS 的 code16/code32 变化处调用 `jit_invalidate_all()`。自检新增
+  `STATE_CR3_INVALIDATE`，先 JIT 生成旧块，再解释执行真实 `MOV CR3,EAX`，确认
+  `pool_epoch` 前进。COM19 selftest-only PASS，正常主程序启动冒烟稳定。
 
 #### Task 4.3 — 写内存触发页失效
 - **目标**：guest 写内存命中已翻译页时 `jit_invalidate_page`（SMC 正确性）。
@@ -781,11 +812,22 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **涉及文件**：`i386.c`（store 路径），`jit_lx7.c`。
 - **验收**：自检：先翻译一块，再改写其字节，再执行 → 走新代码而非旧块。
 - **风险**：每次写都查表会很慢，需用页位图/脏标记降开销（与 4.4 结合）。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。新增 `jit_store_invalidate()`，在
+  非 MMIO 的 `store8/16/32` 路径完成 `pstore*` 后按实际物理写入范围触发 JIT 失效；
+  跨页/拆分写会分别对各段调用。MMIO 写仍交给设备 callback，不做 JIT SMC 处理。自检
+  通过修改已翻译代码字节验证旧块被丢弃并重新翻译新代码。
 
 #### Task 4.4 — 精确页内范围失效
 - **目标**：只失效"源字节范围与写范围重叠"的块（利用 `guest_paddr/guest_end`）。
 - **范围(≈2h)**：把 4.3 的整页失效细化为范围重叠；维护页→块的轻量索引（`JITPageTrack`）。
 - **验收**：写未重叠区域不误失效；写重叠区域必失效。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。新增 `jit_invalidate_range()`，用
+  `guest_paddr/guest_end` 判断写入范围是否与 block 源字节范围重叠；保留
+  `jit_invalidate_page()` 作为整页 wrapper。最初每次 guest RAM 写都扫描 cache，导致正常
+  启动明显变慢；随后增加 1024-bit hashed translated-code page bitmap，只有写入可能含有
+  JIT 代码的页时才扫描 block。自检新增 `SMC_RANGE_NONOVERLAP` 与 `SMC_RANGE_OVERLAP`：
+  同页非重叠写不增加 invalidations，重叠写必失效并执行修改后的新代码。COM19
+  selftest-only PASS；正常主程序恢复到 45 秒内到达 `set VGA mode 1`。
 
 ---
 
@@ -795,16 +837,34 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **目标**：量化 JIT on/off 的收益。
 - **范围(≈2h)**：用 `tools/dosbench.asm` 或固定 DOS 工作负载，统计 cycle/帧率/耗时；记录到 `docs/`。
 - **验收**：得到可复现的基准数字与命中率/bail 分布。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成启动窗口基线。分别构建并刷入 level3
+  与临时 level0 固件，均抓取 45 秒启动串口日志，两者都到达 `set VGA mode 1`。level3
+  代表性 perf 样本为约 5.9s `ips=550889`、约 10.9s `ips=1044520`、约 20.9s
+  `ips=875941`；level0 在该启动工作负载中数值接近，说明当前 opcode 覆盖尚未命中 DOS
+  后段主热路径。备注：本次是启动窗口基线，后续仍需专门 DOS benchmark 或 bail/hot-path
+  统计来指导扩面。
 
 #### Task 5.2 — 最小寄存器存取与窄编码
 - **目标**：prologue/epilogue 只 load/store 块内实际用到的 GPR；启用 `mov.n`/`addi.n` 等窄编码。
 - **范围(≈2h)**：在扫描阶段统计读写寄存器集合；epilogue 只回写脏寄存器。
 - **验收**：自检仍 PASS；基准较 5.1 改善。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成保守版。扫描 action 后计算每个 block 的
+  GPR read/write mask；prologue 只 load 会被读取的寄存器，epilogue 只 store 会被写入的
+  寄存器，避免 NOP/JMP/CMP-only 等块无意义地保存全部 8 个 GPR。此实现保持现有完整
+  Xtensa windowed 函数 ABI，不触碰 Task 3.4 的直接块链接阻塞点。COM19 selftest-only
+  结果 `96/96 PASS`，正常主程序 app-flash 后 45 秒启动冒烟无 WDT/panic，到达
+  `Booting from 0000:7c00` 与 `set VGA mode 1`。
 
 #### Task 5.3 — 扩大 opcode 覆盖
 - **目标**：按 P0.5 的 bail 统计，优先放开出现最多的安全 opcode（如更多 ALU/移位/`MOVZX/MOVSX` 寄存器形式）。
 - **范围(≈2h)**：每次放开 1–2 个，先自检后冒烟。
 - **验收**：命中率上升，启动/基准稳定。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成第一批扩面。放开已有 decoder/emitter
+  但尚未进入 runtime gate 的 `XCHG EAX,r32`，在 `TINY386_JIT_LEVEL >= 3` 下启用。
+  自检新增 `XCHG_EAX_EBX` 与 `XCHG_EAX_EDI` 两个差分用例，同时覆盖 5.2 的 GPR mask
+  不漏 load/store。COM19 selftest-only 结果 `96/96 PASS`；切回正常主程序后 app-flash
+  成功，45 秒启动冒烟无 WDT/panic，到达 `Booting from 0000:7c00` 与 `set VGA mode 1`。
+  备注：下一批 opcode 应优先依据 bail/hot-path 统计选择，不再靠猜测扩面。
 
 #### Task 5.4 — 内存操作数（长期，谨慎）
 - **目标**：支持寄存器寻址的内存读写（需 TLB/页走查快路径）。
