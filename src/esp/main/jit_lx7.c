@@ -456,6 +456,14 @@ static inline bool emit_call8_target(EmitPtr *p, const uint8_t *target)
     return true;
 }
 
+static inline void emit_callx8(EmitPtr *p, int s)
+{
+    (*p)[0] = 0xe0;
+    (*p)[1] = (uint8_t)s;
+    (*p)[2] = 0x00;
+    *p += 3;
+}
+
 /* SRLI for shift amounts 16-31 (uses MOVI + SSR + SRL, 9 bytes) */
 static void emit_ssri_wide(EmitPtr *p, int r, int sa)
 {
@@ -630,6 +638,36 @@ static bool emit_linked_exit(EmitPtr *p, const uint8_t *code_end, int cpu_reg,
     return true;
 }
 
+static void emit_store_gprs(EmitPtr *p, int cpu_reg, uint8_t store_mask)
+{
+    for (int i = 0; i < 8; i++) {
+        if (store_mask & (1u << i))
+            emit_s32i(p, LX7_GPR_BASE + i, cpu_reg, GPR_OFF(i) / 4);
+    }
+}
+
+static void emit_load_gprs(EmitPtr *p, int cpu_reg, uint8_t load_mask)
+{
+    for (int i = 0; i < 8; i++) {
+        if (load_mask & (1u << i))
+            emit_l32i(p, LX7_GPR_BASE + i, cpu_reg, GPR_OFF(i) / 4);
+    }
+}
+
+static void __attribute__((noinline))
+jit_helper_mov_rm32(CPUI386 *cpu, uint32_t addr, uint32_t dst)
+{
+    uint32_t value = 0;
+    if (cpu_load32(cpu, 3, addr, &value))
+        cpui386_set_gpr(cpu, (int)dst, value);
+}
+
+static void __attribute__((noinline))
+jit_helper_mov_mr32(CPUI386 *cpu, uint32_t addr, uint32_t value)
+{
+    (void)cpu_store32(cpu, 3, addr, value);
+}
+
 /* ================================================================== */
 /*  Section 3 — x86 Instruction Decoder (scan-only, no execution)     */
 /* ================================================================== */
@@ -651,6 +689,12 @@ typedef struct {
     bool reg_only;  /* true when mod==3 (register operand only) */
 } ModRM;
 
+typedef struct {
+    int base;
+    int32_t disp;
+    int len;
+} MemOp;
+
 static inline ModRM decode_modrm(uint8_t b)
 {
     ModRM m;
@@ -659,6 +703,32 @@ static inline ModRM decode_modrm(uint8_t b)
     m.rm       =  b       & 7;
     m.reg_only = (m.mod == 3);
     return m;
+}
+
+static bool decode_simple_memop(const uint8_t *src, const ModRM *m, MemOp *mem)
+{
+    int len = 0;
+    int32_t disp = 0;
+
+    if (m->reg_only || m->rm == 4)
+        return false;
+    if (m->mod == 0 && m->rm == 5)
+        return false;
+
+    if (m->mod == 1) {
+        disp = (int32_t)(int8_t)src[len++];
+    } else if (m->mod == 2) {
+        disp = (int32_t)((uint32_t)src[len] |
+                         ((uint32_t)src[len + 1] << 8) |
+                         ((uint32_t)src[len + 2] << 16) |
+                         ((uint32_t)src[len + 3] << 24));
+        len += 4;
+    }
+
+    mem->base = m->rm;
+    mem->disp = disp;
+    mem->len = len;
+    return true;
 }
 
 /* Decode the x86 instruction at *src.
@@ -690,6 +760,8 @@ typedef enum {
     ACT_CDQ,        /* EDX = sign_extend(EAX), no flags */
     ACT_XCHG_EAX_R, /* swap EAX with another GPR, no flags */
     ACT_BSWAP_R,    /* byte-swap a 32-bit GPR, no flags */
+    ACT_MOV_RM32,   /* dst_reg = dword ptr [base_reg + disp] */
+    ACT_MOV_MR32,   /* dword ptr [base_reg + disp] = src_reg */
     ACT_BLOCK_END,  /* last instruction of block, no jump */
 } ActionType;
 
@@ -714,6 +786,8 @@ typedef struct {
     int        dst;       /* x86 GPR index 0-7 */
     int        src;       /* x86 GPR index 0-7 (or shift amount) */
     int32_t    imm;       /* immediate value */
+    int        mem_base;  /* x86 base GPR for simple memory operands */
+    int32_t    mem_disp;  /* signed displacement for simple memory operands */
     AluOp      alu_op;
     ShiftOp    sh_op;
     CondCode   cc;
@@ -748,6 +822,8 @@ static const char *jit_action_name(ActionType type)
     case ACT_CDQ:         return "CDQ";
     case ACT_XCHG_EAX_R:  return "XCHG_EAX_R";
     case ACT_BSWAP_R:     return "BSWAP_R";
+    case ACT_MOV_RM32:    return "MOV_RM32";
+    case ACT_MOV_MR32:    return "MOV_MR32";
     case ACT_BLOCK_END:   return "BLOCK_END";
     default:              return "?";
     }
@@ -803,6 +879,13 @@ static void jit_action_reg_masks(const X86Action *a, uint8_t *read_mask, uint8_t
     case ACT_BSWAP_R:
         *read_mask |= dst;
         *write_mask |= dst;
+        break;
+    case ACT_MOV_RM32:
+        *read_mask |= (uint8_t)(1u << a->mem_base);
+        *write_mask |= dst;
+        break;
+    case ACT_MOV_MR32:
+        *read_mask |= src | (uint8_t)(1u << a->mem_base);
         break;
     default:
         break;
@@ -930,7 +1013,22 @@ static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
      */
     if (op == 0x89 || op == 0x8B) {
         ModRM m = decode_modrm(src[len++]);
-        if (!m.reg_only) return 0;
+        if (!m.reg_only) {
+            MemOp mem;
+            if (!decode_simple_memop(src + len, &m, &mem))
+                return 0;
+            len += mem.len;
+            if (op == 0x8B) {
+                a->type = ACT_MOV_RM32;
+                a->dst = m.reg;
+            } else {
+                a->type = ACT_MOV_MR32;
+                a->src = m.reg;
+            }
+            a->mem_base = mem.base;
+            a->mem_disp = mem.disp;
+            return len;
+        }
         a->type = ACT_MOV_RR;
         a->dst  = (op == 0x89) ? m.rm  : m.reg;
         a->src  = (op == 0x89) ? m.reg : m.rm;
@@ -1087,7 +1185,7 @@ typedef struct {
 static bool emit_action(EmitPtr *p, uint8_t *buf_end,
                          const X86Action *a, CmpState *cs,
                          uint32_t fallback_eip, int cpu_reg,
-                         uint8_t store_mask)
+                         uint8_t load_mask, uint8_t store_mask)
 {
 #define GUARD(n) if ((*p) + (n) > buf_end) return false
 
@@ -1141,6 +1239,36 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         emit_or(p, dr, dr, t2);
         break;
     }
+
+    case ACT_MOV_RM32:
+        GUARD(112);
+        emit_store_gprs(p, cpu_reg, store_mask);
+        emit_mov(p, t0, X86REG_TO_LX7(a->mem_base));
+        if (a->mem_disp != 0) {
+            emit_movi32(p, t1, (uint32_t)a->mem_disp);
+            emit_add(p, t0, t0, t1);
+        }
+        emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_mov_rm32);
+        emit_movi(p, 12, a->dst);
+        emit_mov(p, 10, cpu_reg);
+        emit_callx8(p, t2);
+        emit_load_gprs(p, cpu_reg, load_mask | store_mask);
+        break;
+
+    case ACT_MOV_MR32:
+        GUARD(112);
+        emit_store_gprs(p, cpu_reg, store_mask);
+        emit_mov(p, t0, X86REG_TO_LX7(a->mem_base));
+        if (a->mem_disp != 0) {
+            emit_movi32(p, t1, (uint32_t)a->mem_disp);
+            emit_add(p, t0, t0, t1);
+        }
+        emit_mov(p, 12, sr);
+        emit_movi32(p, t2, (uint32_t)(uintptr_t)jit_helper_mov_mr32);
+        emit_mov(p, 10, cpu_reg);
+        emit_callx8(p, t2);
+        emit_load_gprs(p, cpu_reg, load_mask | store_mask);
+        break;
 
     /* ---- MOV ------------------------------------------------ */
     case ACT_MOV_RR:
@@ -1794,6 +1922,9 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
         return true;
     if (TINY386_JIT_LEVEL >= 3 && a->type == ACT_XCHG_EAX_R)
         return true;
+    if (TINY386_JIT_LEVEL >= 3 &&
+        (a->type == ACT_MOV_RM32 || a->type == ACT_MOV_MR32))
+        return true;
     return false;
 }
 
@@ -2123,7 +2254,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         int bytes = action_bytes[n];
 
         ok = emit_action(&p, code_end, a, &cs, cur_eip + bytes, LX7_CPU_REG,
-                         store_mask);
+                         load_mask, store_mask);
         if (!ok) break;
         JIT_TRACEF("[jit_trace] emit #%d action=%s x86_eip=0x%08x "
                    "next=0x%08x host_used=%u\n",

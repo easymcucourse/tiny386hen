@@ -44,6 +44,8 @@
 #define ACT_JMP     15
 #define ACT_JCC     16
 #define ACT_XCHG_EAX_R 19
+#define ACT_MOV_RM32   21
+#define ACT_MOV_MR32   22
 
 #define JIT_ST_ALLOW(act)  (1u << (unsigned)(act))
 
@@ -156,6 +158,8 @@ static const uint8_t code_inc_eax[] = { 0x40 };
 static const uint8_t code_dec_eax[] = { 0x48 };
 static const uint8_t code_xchg_eax_ebx[] = { 0x93 };
 static const uint8_t code_xchg_eax_edi[] = { 0x97 };
+static const uint8_t code_mov_eax_mem_ebx_disp8[] = { 0x8B, 0x43, 0x20 };
+static const uint8_t code_mov_mem_ebx_disp8_eax[] = { 0x89, 0x43, 0x24 };
 static const uint8_t code_jmp_rel8[] = {
 	0xEB, 0x03,                   /* jmp +3 */
 	0xB8, 0x11, 0x11, 0x11, 0x11, /* skipped */
@@ -456,6 +460,15 @@ static void init_dead_flags_add_state(CPUI386 *cpu)
 	cpu_setflags(cpu, 0, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF);
 }
 
+static void init_mem_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x23242526u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 0, 0x89abcdefu);
+	cpui386_set_gpr(cpu, 3, 0x00001800u);
+	cpu_setflags(cpu, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF, 0);
+}
+
 static const char *gpr_name(int i)
 {
 	static const char *names[] = {
@@ -735,6 +748,67 @@ static bool run_linked_exit_case(CPUI386 *cpu, uint8_t *mem)
 
 	esp_rom_printf("[jit_selftest] PASS %s_link (interp=%d jit=%d)\n",
 		       tc.name, interp_steps, jit_steps);
+	return true;
+}
+
+static void setup_mem_fixture(uint8_t *mem)
+{
+	mem[0x1820] = 0x44;
+	mem[0x1821] = 0x33;
+	mem[0x1822] = 0x22;
+	mem[0x1823] = 0x11;
+	mem[0x1824] = 0xaa;
+	mem[0x1825] = 0xbb;
+	mem[0x1826] = 0xcc;
+	mem[0x1827] = 0xdd;
+}
+
+static bool run_memory_mov_case(CPUI386 *cpu, uint8_t *mem,
+				const SelftestCase *tc, uint32_t probe_addr)
+{
+	JITCpuSnapshot baseline;
+	JITCpuSnapshot interp_result;
+	JITCpuSnapshot jit_result;
+	uint32_t interp_mem;
+	uint32_t jit_mem;
+	int interp_steps;
+	int jit_steps;
+
+	setup_cpu(cpu, mem, tc);
+	setup_mem_fixture(mem);
+	jit_cpu_snapshot(cpu, &baseline);
+
+	jit_cpu_restore(cpu, &baseline);
+	interp_steps = jit_cpu_step_interp(cpu, 1);
+	jit_cpu_snapshot(cpu, &interp_result);
+	memcpy(&interp_mem, mem + probe_addr, sizeof(interp_mem));
+
+	setup_cpu(cpu, mem, tc);
+	setup_mem_fixture(mem);
+	jit_cpu_restore(cpu, &baseline);
+	jit_cpu_invalidate_cache(cpu);
+	jit_selftest_set_allowed_actions(tc->jit_allow);
+	jit_steps = jit_cpu_step_jit(cpu, 1);
+	jit_selftest_clear_allowed_actions();
+	jit_cpu_snapshot(cpu, &jit_result);
+	memcpy(&jit_mem, mem + probe_addr, sizeof(jit_mem));
+
+	if (interp_steps != 1 || jit_steps != 1) {
+		esp_rom_printf("[jit_selftest] FAIL %s_mem: steps interp=%d jit=%d\n",
+			       tc->name, interp_steps, jit_steps);
+		return false;
+	}
+	if (!compare_snapshots(tc->name, &interp_result, &jit_result))
+		return false;
+	if (interp_mem != jit_mem) {
+		esp_rom_printf("[jit_selftest] FAIL %s_mem: mem[0x%04" PRIx32
+			       "] 0x%08" PRIx32 " != 0x%08" PRIx32 "\n",
+			       tc->name, probe_addr, interp_mem, jit_mem);
+		return false;
+	}
+
+	esp_rom_printf("[jit_selftest] PASS %s_mem (interp=%d jit=%d)\n",
+		       tc->name, interp_steps, jit_steps);
 	return true;
 }
 
@@ -1177,6 +1251,20 @@ int jit_selftest_run(void)
 			.jit_allow = JIT_ST_ALLOW(ACT_XCHG_EAX_R),
 			.init = init_mov_rr_state,
 		},
+		{
+			.name = "MOV_EAX_mem_EBX_disp8",
+			.code = code_mov_eax_mem_ebx_disp8,
+			.code_len = sizeof(code_mov_eax_mem_ebx_disp8),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_RM32),
+			.init = init_mem_state,
+		},
+		{
+			.name = "MOV_mem_EBX_disp8_EAX",
+			.code = code_mov_mem_ebx_disp8_eax,
+			.code_len = sizeof(code_mov_mem_ebx_disp8_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR32),
+			.init = init_mem_state,
+		},
 	};
 	static const SelftestCase mixed_nop_mov = {
 		.name = "MIXED_NOP_THEN_MOV_EAX",
@@ -1344,8 +1432,15 @@ int jit_selftest_run(void)
 	}
 
 	for (size_t i = 0; i < case_count; i++) {
-		if (!run_case(cpu, mem, &cases[i]))
+		if (cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_RM32)) {
+			if (!run_memory_mov_case(cpu, mem, &cases[i], 0x1820))
+				failures++;
+		} else if (cases[i].jit_allow == JIT_ST_ALLOW(ACT_MOV_MR32)) {
+			if (!run_memory_mov_case(cpu, mem, &cases[i], 0x1824))
+				failures++;
+		} else if (!run_case(cpu, mem, &cases[i])) {
 			failures++;
+		}
 	}
 	if (!run_mixed_case(cpu, mem, &mixed_nop_mov, 2, 1))
 		failures++;

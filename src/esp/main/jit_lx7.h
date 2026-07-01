@@ -1,15 +1,18 @@
 /*
  * jit_lx7.h - Xtensa LX7 backend for the generic x86 JIT interface.
  *
- * Current scope: low-risk register-only i386 blocks.
+ * Current scope: low-risk i386 blocks.
  *   - Register ALU : MOV, ADD, SUB, AND, OR, XOR, NOT, NEG, INC, DEC.
  *   - Immediate ALU: same ops with 8/32-bit immediates.
  *   - Shifts       : SHL/SHR/SAR by imm8 or CL, register-only.
  *   - CMP/TEST + Jcc fusion into native LX7 branches.
  *   - Unconditional JMP rel8 / rel32, gated until target tracing is solid.
+ *   - Minimal MOV r32,[base+disp] / MOV [base+disp],r32 via C load/store
+ *     helpers for the first Task 5.4 memory-operand slice.
  *
  * Current fallback surface:
- *   - Any memory operand. The LX7 backend does not own TLB/page-walk logic.
+ *   - Complex memory operands: SIB, segment overrides, 16-bit addressing,
+ *     non-MOV operations, and direct [disp32] addressing.
  *   - CALL / RET. These need x86 stack semantics and block-link boundaries.
  *   - Privileged/system instructions.
  *   - FPU, MMX, SSE.
