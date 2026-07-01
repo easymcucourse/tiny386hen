@@ -699,17 +699,39 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - **范围(≈2h)**：自检覆盖 INC/DEC 对 OF/SF/ZF/AF/PF 更新且 CF 不变；按需用专门 cc.op 或"标志可证死"才放开。
 - **涉及文件**：`jit_lx7.c`，`jit_selftest.c`。
 - **验收**：INC/DEC 自检 PASS（含 CF 保留）；启动通过。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成受限放开。新增 `JIT_CC_INC32`、
+  `JIT_CC_DEC32` 和 `JIT_CC_MASK_ARITH_NO_CF` 静态校验；NEG 写 `JIT_CC_NEG32`，
+  INC/DEC 写 `JIT_CC_INC32/DEC32` 且 `cc.mask` 不含 CF，从而保留已 materialized 的 CF。
+  自检新增 NOT flags-preserve、NEG zero/min、INC/DEC CF set/clear 用例，COM19 selftest-only
+  结果 `42/42 PASS`。运行时放开 NEG；INC/DEC 仅在 `flags_dead` 为真时放开，避免前序 lazy CF
+  尚未物化时错误保留。切回正常主程序后 app-flash 成功，30 秒启动冒烟无 WDT/panic，到达
+  `Booting from 0000:7c00` 与 `set VGA mode 1`。
 
 #### Task 2.4 — 死标志消除（flags_dead）验证
 - **目标**：验证 `jit_translate` 反向扫描的 `flags_dead` 推导正确（写标志后被覆盖、且中间无 Jcc/读标志）。
 - **范围(≈2h)**：自检构造"ADD 后紧跟 ADD 覆盖标志、再 Jcc"等序列，比较最终标志。
 - **验收**：死标志路径与非死路径结果一致；无错误省略。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成。新增 `BLOCK_ADD_ADD_COVER_FLAGS`
+  多指令块：第一条 `ADD EAX,EBX` 产生的 flags 被第二条 `ADD EAX,ECX` 覆盖，但第二条仍依赖第一条的
+  EAX 数据结果，用于验证 flags-dead 只省略 flags 写出、不丢 GPR 数据流。修复自检 harness：每个 case
+  setup 时清理测试代码窗口，避免短指令用例读到前一用例残留 bytes。COM19 selftest-only 结果
+  `43/43 PASS`；切回正常主程序后 app-flash 成功，30 秒启动冒烟无 WDT/panic，到达
+  `Booting from 0000:7c00` 与 `set VGA mode 1`。
 
 #### Task 2.5 — 移位标志（SHL/SHR/SAR，imm 与 CL）
 - **目标**：移位的 CF/OF/SF/ZF/PF 与解释器一致（移位 0 不改标志的特例）。
 - **范围(≈2h)**：自检遍历移位量 0/1/中间/31；放开 `ACT_SHx_RI`/`ACT_SHx_CL`。
 - **验收**：自检 PASS；启动通过。
 - **备注**：当前移位 emitter 未写 `cc.*`——本 task 需补齐标志写出或在标志活时回退解释器。
+- **执行结果（2026-07-01 / COM19）**：✅ 已完成 imm 路径。新增 `JIT_CC_SHL/SHR/SAR`
+  静态校验，`ACT_SHx_RI` 对移位量 0 保持 no-op、不改 flags；flags live 时写出
+  `cc.dst/cc.dst2/cc.src1/cc.op/cc.mask`，flags dead 时只发实际移位。修正 Xtensa
+  `SLLI/SRLI/SRAI` 立即移位编码以及 `SSL/SSR` SAR-load 编码；此前 COM19 上
+  `SHL_RI_count1` 触发 `IllegalInstruction`，经 objdump 对照后已修复。自检新增
+  SHL/SHR/SAR 的 count 0/1/4/31 共 12 例，COM19 selftest-only 结果 `55/55 PASS`。
+  切回正常主程序后 app-flash 成功，30 秒启动冒烟无 WDT/panic，到达
+  `Booting from 0000:7c00` 与 `set VGA mode 1`。`ACT_SHx_CL` 仍保持未放开，后续可单独补
+  CL masked count 与 flags live 覆盖。
 
 ---
 

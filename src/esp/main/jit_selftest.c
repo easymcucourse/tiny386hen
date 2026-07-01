@@ -32,6 +32,11 @@
 #define ACT_MOV_RI  3
 #define ACT_ALU_RR  4
 #define ACT_ALU_RI  5
+#define ACT_NOT_R   6
+#define ACT_NEG_R   7
+#define ACT_INC_R   8
+#define ACT_DEC_R   9
+#define ACT_SHx_RI  10
 
 #define JIT_ST_ALLOW(act)  (1u << (unsigned)(act))
 
@@ -82,6 +87,19 @@ typedef struct {
 	int32_t imm;
 } AluSelftestCase;
 
+typedef enum {
+	SHIFT_ST_SHL,
+	SHIFT_ST_SHR,
+	SHIFT_ST_SAR,
+} ShiftSelftestOp;
+
+typedef struct {
+	const char *name;
+	ShiftSelftestOp op;
+	uint32_t eax;
+	uint8_t count;
+} ShiftSelftestCase;
+
 static const uint8_t code_nop[] = { 0x90 };
 static const uint8_t code_mov_eax[] = { 0xB8, 0x78, 0x56, 0x34, 0x12 };
 static const uint8_t code_mov_ebx_neg[] = { 0xBB, 0x00, 0x00, 0x00, 0x80 };
@@ -101,6 +119,14 @@ static const uint8_t code_block_mov_chain[] = {
 	0x8B, 0xD8,                   /* mov ebx,eax */
 	0x90,                         /* nop */
 };
+static const uint8_t code_block_add_add_cover_flags[] = {
+	0x01, 0xD8,                   /* add eax,ebx; flags dead */
+	0x01, 0xC8,                   /* add eax,ecx; flags live */
+};
+static const uint8_t code_not_eax[] = { 0xF7, 0xD0 };
+static const uint8_t code_neg_eax[] = { 0xF7, 0xD8 };
+static const uint8_t code_inc_eax[] = { 0x40 };
+static const uint8_t code_dec_eax[] = { 0x48 };
 
 static uint8_t build_alu_code(const AluSelftestCase *tc, uint8_t *code)
 {
@@ -146,6 +172,26 @@ static uint8_t build_alu_code(const AluSelftestCase *tc, uint8_t *code)
 	code[4] = (uint8_t)(imm >> 16);
 	code[5] = (uint8_t)(imm >> 24);
 	return 6;
+}
+
+static uint8_t build_shift_code(const ShiftSelftestCase *tc, uint8_t *code)
+{
+	code[0] = 0xC1;
+	switch (tc->op) {
+	case SHIFT_ST_SHL:
+		code[1] = 0xE0; /* shl eax,imm8 */
+		break;
+	case SHIFT_ST_SHR:
+		code[1] = 0xE8; /* shr eax,imm8 */
+		break;
+	case SHIFT_ST_SAR:
+		code[1] = 0xF8; /* sar eax,imm8 */
+		break;
+	default:
+		return 0;
+	}
+	code[2] = tc->count;
+	return 3;
 }
 
 static const esp_partition_t *find_flash_probe_partition(void)
@@ -276,6 +322,73 @@ static void init_mov_rr_state(CPUI386 *cpu)
 	cpu_setflags(cpu, 0, FL_ZF | FL_SF | FL_PF);
 }
 
+static void init_not_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x01020304u + 0x11111111u * (unsigned)i);
+	cpui386_set_gpr(cpu, 0, 0x55aa00ffu);
+	cpu_setflags(cpu, 0, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF);
+}
+
+static void init_neg_zero_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x21222324u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 0, 0x00000000u);
+	cpu_setflags(cpu, 0, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF);
+}
+
+static void init_neg_min_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x31323334u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 0, 0x80000000u);
+	cpu_setflags(cpu, FL_CF | FL_OF, 0);
+	cpu_setflags(cpu, 0, FL_AF | FL_ZF | FL_SF | FL_PF);
+}
+
+static void init_inc_cf_set_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x41424344u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 0, 0x7fffffffu);
+	cpu_setflags(cpu, FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF, FL_CF);
+}
+
+static void init_inc_cf_clear_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x51525354u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 0, 0xffffffffu);
+	cpu_setflags(cpu, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF, 0);
+}
+
+static void init_dec_cf_set_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x61626364u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 0, 0x80000000u);
+	cpu_setflags(cpu, FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF, FL_CF);
+}
+
+static void init_dec_cf_clear_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x71727374u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 0, 0x00000001u);
+	cpu_setflags(cpu, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF, 0);
+}
+
+static void init_dead_flags_add_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x81828384u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 0, 0xffffffffu); /* EAX */
+	cpui386_set_gpr(cpu, 1, 0x7fffffffu); /* ECX */
+	cpui386_set_gpr(cpu, 3, 0x00000001u); /* EBX */
+	cpu_setflags(cpu, 0, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF);
+}
+
 static const char *gpr_name(int i)
 {
 	static const char *names[] = {
@@ -357,6 +470,7 @@ static bool compare_snapshots(const char *case_name,
 static void setup_cpu(CPUI386 *cpu, uint8_t *mem, const SelftestCase *tc)
 {
 	cpui386_reset_pm(cpu, ST_CODE_BASE);
+	memset(mem + ST_CODE_BASE, 0xcc, 64);
 	memcpy(mem + ST_CODE_BASE, tc->code, tc->code_len);
 	if (tc->init)
 		tc->init(cpu);
@@ -506,6 +620,7 @@ static void setup_alu_cpu(CPUI386 *cpu, uint8_t *mem,
 	uint8_t code_len = build_alu_code(tc, code);
 
 	cpui386_reset_pm(cpu, ST_CODE_BASE);
+	memset(mem + ST_CODE_BASE, 0xcc, 64);
 	memcpy(mem + ST_CODE_BASE, code, code_len);
 	cpui386_set_gpr(cpu, 0, tc->eax);
 	cpui386_set_gpr(cpu, 3, tc->ebx);
@@ -541,6 +656,63 @@ static bool run_alu_case(CPUI386 *cpu, uint8_t *mem,
 		 tc->op == ALU_ST_XOR_RR) ?
 		JIT_ST_ALLOW(ACT_ALU_RR) : JIT_ST_ALLOW(ACT_ALU_RI);
 	jit_selftest_set_allowed_actions(allow);
+	jit_steps = jit_cpu_step_jit(cpu, 1);
+	jit_selftest_clear_allowed_actions();
+	jit_cpu_snapshot(cpu, &jit_result);
+
+	if (interp_steps != 1) {
+		esp_rom_printf("[jit_selftest] FAIL %s: interpreter steps %d != 1\n",
+			       tc->name, interp_steps);
+		return false;
+	}
+	if (jit_steps != 1) {
+		esp_rom_printf("[jit_selftest] FAIL %s: JIT steps %d != 1\n",
+			       tc->name, jit_steps);
+		return false;
+	}
+	if (!compare_snapshots(tc->name, &interp_result, &jit_result))
+		return false;
+
+	esp_rom_printf("[jit_selftest] PASS %s (interp=%d jit=%d)\n",
+		       tc->name, interp_steps, jit_steps);
+	return true;
+}
+
+static void setup_shift_cpu(CPUI386 *cpu, uint8_t *mem,
+			    const ShiftSelftestCase *tc)
+{
+	uint8_t code[4];
+	uint8_t code_len = build_shift_code(tc, code);
+
+	cpui386_reset_pm(cpu, ST_CODE_BASE);
+	memset(mem + ST_CODE_BASE, 0xcc, 64);
+	memcpy(mem + ST_CODE_BASE, code, code_len);
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x91929394u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 0, tc->eax);
+	cpu_setflags(cpu, 0, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF);
+	jit_cpu_prepare_exec(cpu, ST_CODE_BASE);
+}
+
+static bool run_shift_case(CPUI386 *cpu, uint8_t *mem,
+			   const ShiftSelftestCase *tc)
+{
+	JITCpuSnapshot baseline;
+	JITCpuSnapshot interp_result;
+	JITCpuSnapshot jit_result;
+	int interp_steps;
+	int jit_steps;
+
+	setup_shift_cpu(cpu, mem, tc);
+	jit_cpu_snapshot(cpu, &baseline);
+
+	jit_cpu_restore(cpu, &baseline);
+	interp_steps = jit_cpu_step_interp(cpu, 1);
+	jit_cpu_snapshot(cpu, &interp_result);
+
+	jit_cpu_invalidate_cache(cpu);
+	jit_cpu_restore(cpu, &baseline);
+	jit_selftest_set_allowed_actions(JIT_ST_ALLOW(ACT_SHx_RI));
 	jit_steps = jit_cpu_step_jit(cpu, 1);
 	jit_selftest_clear_allowed_actions();
 	jit_cpu_snapshot(cpu, &jit_result);
@@ -601,6 +773,55 @@ int jit_selftest_run(void)
 			.jit_allow = JIT_ST_ALLOW(ACT_MOV_RR),
 			.init = init_mov_rr_state,
 		},
+		{
+			.name = "NOT_EAX_flags_preserve",
+			.code = code_not_eax,
+			.code_len = sizeof(code_not_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_NOT_R),
+			.init = init_not_state,
+		},
+		{
+			.name = "NEG_EAX_zero",
+			.code = code_neg_eax,
+			.code_len = sizeof(code_neg_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_NEG_R),
+			.init = init_neg_zero_state,
+		},
+		{
+			.name = "NEG_EAX_min",
+			.code = code_neg_eax,
+			.code_len = sizeof(code_neg_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_NEG_R),
+			.init = init_neg_min_state,
+		},
+		{
+			.name = "INC_EAX_cf_set_overflow",
+			.code = code_inc_eax,
+			.code_len = sizeof(code_inc_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_INC_R),
+			.init = init_inc_cf_set_state,
+		},
+		{
+			.name = "INC_EAX_cf_clear_zero",
+			.code = code_inc_eax,
+			.code_len = sizeof(code_inc_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_INC_R),
+			.init = init_inc_cf_clear_state,
+		},
+		{
+			.name = "DEC_EAX_cf_set_overflow",
+			.code = code_dec_eax,
+			.code_len = sizeof(code_dec_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_DEC_R),
+			.init = init_dec_cf_set_state,
+		},
+		{
+			.name = "DEC_EAX_cf_clear_zero",
+			.code = code_dec_eax,
+			.code_len = sizeof(code_dec_eax),
+			.jit_allow = JIT_ST_ALLOW(ACT_DEC_R),
+			.init = init_dec_cf_clear_state,
+		},
 	};
 	static const SelftestCase mixed_nop_mov = {
 		.name = "MIXED_NOP_THEN_MOV_EAX",
@@ -624,6 +845,13 @@ int jit_selftest_run(void)
 			     JIT_ST_ALLOW(ACT_MOV_RR) |
 			     JIT_ST_ALLOW(ACT_NOP),
 		.init = init_mov_rr_state,
+	};
+	static const SelftestCase block_add_add_cover_flags = {
+		.name = "BLOCK_ADD_ADD_COVER_FLAGS",
+		.code = code_block_add_add_cover_flags,
+		.code_len = sizeof(code_block_add_add_cover_flags),
+		.jit_allow = JIT_ST_ALLOW(ACT_ALU_RR),
+		.init = init_dead_flags_add_state,
 	};
 	static const AluSelftestCase alu_cases[] = {
 		{ "ADD_RR_zero",      ALU_ST_ADD_RR, 0x00000000u, 0x00000000u, 0 },
@@ -653,14 +881,29 @@ int jit_selftest_run(void)
 		{ "XOR_RI_zero",      ALU_ST_XOR_RI, 0x12345678u, 0, 0x12345678 },
 		{ "XOR_RI_sign",      ALU_ST_XOR_RI, 0x7fffffffu, 0, -1 },
 	};
+	static const ShiftSelftestCase shift_cases[] = {
+		{ "SHL_RI_count0", SHIFT_ST_SHL, 0x12345678u, 0 },
+		{ "SHL_RI_count1", SHIFT_ST_SHL, 0x40000001u, 1 },
+		{ "SHL_RI_count4", SHIFT_ST_SHL, 0x0800000fu, 4 },
+		{ "SHL_RI_count31", SHIFT_ST_SHL, 0x00000003u, 31 },
+		{ "SHR_RI_count0", SHIFT_ST_SHR, 0x87654321u, 0 },
+		{ "SHR_RI_count1", SHIFT_ST_SHR, 0x80000001u, 1 },
+		{ "SHR_RI_count4", SHIFT_ST_SHR, 0xf000000fu, 4 },
+		{ "SHR_RI_count31", SHIFT_ST_SHR, 0x80000000u, 31 },
+		{ "SAR_RI_count0", SHIFT_ST_SAR, 0x87654321u, 0 },
+		{ "SAR_RI_count1", SHIFT_ST_SAR, 0x80000001u, 1 },
+		{ "SAR_RI_count4", SHIFT_ST_SAR, 0xf000000fu, 4 },
+		{ "SAR_RI_count31", SHIFT_ST_SAR, 0x80000000u, 31 },
+	};
 	FlashReadProbe flash_before;
 	FlashReadProbe flash_after;
 	bool flash_before_ok;
 	const unsigned case_count = (unsigned)(sizeof(cases) / sizeof(cases[0]));
 	const unsigned mixed_count = 2u;
-	const unsigned block_count = 1u;
+	const unsigned block_count = 2u;
 	const unsigned alu_count = (unsigned)(sizeof(alu_cases) / sizeof(alu_cases[0]));
-	const unsigned check_count = case_count + mixed_count + block_count + alu_count + 1u;
+	const unsigned shift_count = (unsigned)(sizeof(shift_cases) / sizeof(shift_cases[0]));
+	const unsigned check_count = case_count + mixed_count + block_count + alu_count + shift_count + 1u;
 	uint8_t *mem;
 	CPUI386 *cpu;
 	int failures = 0;
@@ -670,8 +913,8 @@ int jit_selftest_run(void)
 		return 1;
 	}
 
-	esp_rom_printf("[jit_selftest] start (%u cases + %u mixed + %u block + %u alu + flash probe)\n",
-		       case_count, mixed_count, block_count, alu_count);
+	esp_rom_printf("[jit_selftest] start (%u cases + %u mixed + %u block + %u alu + %u shift + flash probe)\n",
+		       case_count, mixed_count, block_count, alu_count, shift_count);
 
 	flash_before_ok = read_flash_probe("before_jit", &flash_before);
 	if (!flash_before_ok)
@@ -702,8 +945,14 @@ int jit_selftest_run(void)
 		failures++;
 	if (!run_block_case(cpu, mem, &block_mov_chain, 3))
 		failures++;
+	if (!run_block_case(cpu, mem, &block_add_add_cover_flags, 2))
+		failures++;
 	for (size_t i = 0; i < alu_count; i++) {
 		if (!run_alu_case(cpu, mem, &alu_cases[i]))
+			failures++;
+	}
+	for (size_t i = 0; i < shift_count; i++) {
+		if (!run_shift_case(cpu, mem, &shift_cases[i]))
 			failures++;
 	}
 

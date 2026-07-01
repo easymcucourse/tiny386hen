@@ -27,6 +27,17 @@
  *    byte[1] = (imm[3:0] << 4) | reg
  *    byte[0] = opbyte
  *
+ *  Shift-immediate format (SLLI, SRLI, SRAI)
+ *    SLLI: byte[0] = (((32 - sa) & 0xf) << 4)
+ *          byte[1] = (r << 4) | s
+ *          byte[2] = ((((32 - sa) >> 4) & 1) << 4) | 1
+ *    SRLI: byte[0] = (t << 4)
+ *          byte[1] = (r << 4) | sa[3:0]
+ *          byte[2] = 0x41
+ *    SRAI: byte[0] = (t << 4)
+ *          byte[1] = (r << 4) | sa[3:0]
+ *          byte[2] = (sa[4] ? 0x31 : 0x21)
+ *
  *  CALL format (J)
  *    bits[23:6]  = 18-bit signed word offset from aligned (PC+4)
  *    bits[ 5:0]  = 0b000110
@@ -244,15 +255,15 @@ static inline void emit_mov(EmitPtr *p, int r, int s)
 /* SSL as  — load SAR = (32 - as) for left shifts */
 static inline void emit_ssl(EmitPtr *p, int s)
 {
-    /* op2=0, op1=4, r=1(fixed), s=source, t=0 */
-    emit_rrr(p, 0x0, 0x4, /*r=*/1, s, /*t=*/0);
+    /* op2=4, op1=0, r=1(fixed), s=source, t=0 */
+    emit_rrr(p, 0x4, 0x0, /*r=*/1, s, /*t=*/0);
 }
 
 /* SSR as  — load SAR = as for right shifts */
 static inline void emit_ssr(EmitPtr *p, int s)
 {
-    /* op2=0, op1=4, r=0(fixed), s=source, t=0 */
-    emit_rrr(p, 0x0, 0x4, /*r=*/0, s, /*t=*/0);
+    /* op2=4, op1=0, r=0(fixed), s=source, t=0 */
+    emit_rrr(p, 0x4, 0x0, /*r=*/0, s, /*t=*/0);
 }
 
 /* SLL ar, as  — shift as left by (32-SAR), result in ar */
@@ -270,33 +281,28 @@ static inline void emit_sra(EmitPtr *p, int r, int t)
 /* ---- Immediate shift: SLLI ar, as, sa  (sa = 1..31) ------------- */
 static inline void emit_slli(EmitPtr *p, int r, int s, int sa)
 {
-    /* op2[0] = ~sa[4]; op2[3:1] = 0; op1 = 1; op0 = 0 */
-    int op2 = (sa < 16) ? 0x1 : 0x0;
-    (*p)[0] = (uint8_t)(0x10 /* op1=1, op0=0 */);
-    (*p)[1] = (uint8_t)((s << 4) | (sa & 0xF));
-    (*p)[2] = (uint8_t)((op2 << 4) | r);
+    int n = 32 - (sa & 31);
+    (*p)[0] = (uint8_t)((n & 0x0F) << 4);
+    (*p)[1] = (uint8_t)((r << 4) | s);
+    (*p)[2] = (uint8_t)(((n >> 4) << 4) | 0x01);
     *p += 3;
 }
 
 /* SRLI ar, at, sa  (sa = 0..15 only; use SSR+SRL for 16-31) */
 static inline void emit_srli(EmitPtr *p, int r, int t, int sa)
 {
-    /* op2=4, op1=1, op0=0; s-field = sa (shift amount) */
-    (*p)[0] = (uint8_t)(0x10);
-    (*p)[1] = (uint8_t)((sa << 4) | t);
-    (*p)[2] = (uint8_t)(0x40 | r);
+    (*p)[0] = (uint8_t)(t << 4);
+    (*p)[1] = (uint8_t)((r << 4) | (sa & 0x0F));
+    (*p)[2] = 0x41;
     *p += 3;
 }
 
 /* SRAI ar, at, sa  (sa = 0..31) */
 static inline void emit_srai(EmitPtr *p, int r, int t, int sa)
 {
-    /* op2 = sa[4] ? 7 : 6; s-field = sa[4]; t-field = at */
-    int op2 = (sa >= 16) ? 0x7 : 0x6;
-    int sf  = (sa >= 16) ? 1   : 0;
-    (*p)[0] = (uint8_t)(0x10);
-    (*p)[1] = (uint8_t)((sf << 4) | t);
-    (*p)[2] = (uint8_t)((op2 << 4) | r);
+    (*p)[0] = (uint8_t)(t << 4);
+    (*p)[1] = (uint8_t)((r << 4) | (sa & 0x0F));
+    (*p)[2] = (uint8_t)((sa & 0x10) ? 0x31 : 0x21);
     *p += 3;
 }
 
@@ -425,6 +431,15 @@ static void emit_ssri_wide(EmitPtr *p, int r, int sa)
     emit_movi(p, LX7_TMP2, sa);
     emit_ssr(p,  LX7_TMP2);
     emit_srl(p,  r, r);
+}
+
+static void emit_srli_any(EmitPtr *p, int r, int sa)
+{
+    if (sa <= 15) {
+        emit_srli(p, r, r, sa);
+    } else {
+        emit_ssri_wide(p, r, sa);
+    }
 }
 
 /* ---- RETW.N: windowed return ------------------------------------- */
@@ -1122,23 +1137,58 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     }
 
     case ACT_INC_R:
-        /*
-         * Known-bad when enabled by itself: updates the register but not x86
-         * EFLAGS. INC must update OF/SF/ZF/AF/PF and preserve CF.
-         */
-        GUARD(3); emit_addi(p, dr, dr, 1); break;
+    case ACT_DEC_R: {
+        bool fd = a->flags_dead;
+        bool inc = (a->type == ACT_INC_R);
 
-    case ACT_DEC_R:
-        /*
-         * Known-bad when enabled by itself: same flag problem as INC. DEC must
-         * update OF/SF/ZF/AF/PF and preserve CF.
-         */
-        GUARD(3); emit_addi(p, dr, dr, -1); break;
+        if (!fd) {
+            GUARD(40);
+            emit_addi(p, dr, dr, inc ? 1 : -1);
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t0, inc ? JIT_CC_INC32 : JIT_CC_DEC32);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi32(p, t0, JIT_CC_MASK_ARITH_NO_CF);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+        } else {
+            GUARD(3);
+            emit_addi(p, dr, dr, inc ? 1 : -1);
+        }
+        break;
+    }
 
     /* ---- Shifts -------------------------------------------- */
     case ACT_SHx_RI: {
         int sa = a->src & 31;
-        GUARD(6);
+        bool fd = a->flags_dead;
+        int cc_op = 0;
+
+        if (sa == 0)
+            break;
+
+        switch (a->sh_op) {
+        case SH_SHL: cc_op = JIT_CC_SHL; break;
+        case SH_SHR: cc_op = JIT_CC_SHR; break;
+        case SH_SAR: cc_op = JIT_CC_SAR; break;
+        default: return false;
+        }
+
+        if (!fd) {
+            GUARD(64);
+            if (a->sh_op == SH_SHR)
+                emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
+
+            emit_mov(p, t0, dr);
+            if (a->sh_op == SH_SHL)
+                emit_srli_any(p, t0, 32 - sa);
+            else
+                emit_srli_any(p, t0, sa - 1);
+            emit_movi(p, t1, 1);
+            emit_and(p, t0, t0, t1);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST2_OFF / 4);
+        } else {
+            GUARD(16);
+        }
+
         switch (a->sh_op) {
         case SH_SHL: emit_slli(p, dr, dr, sa);        break;
         case SH_SHR:
@@ -1146,6 +1196,13 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
             else          { emit_ssri_wide(p, dr, sa); } /* helper below */
             break;
         case SH_SAR: emit_srai(p, dr, dr, sa);        break;
+        }
+        if (!fd) {
+            emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+            emit_movi(p, t0, cc_op);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+            emit_movi32(p, t0, JIT_CC_MASK_LOGIC);
+            emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
         }
         break;
     }
@@ -1539,6 +1596,14 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
          a->alu_op == ALU_AND || a->alu_op == ALU_OR ||
          a->alu_op == ALU_XOR))
         return true;
+    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NEG_R)
+        return true;
+    if (TINY386_JIT_LEVEL >= 2 &&
+        (a->type == ACT_INC_R || a->type == ACT_DEC_R) &&
+        a->flags_dead)
+        return true;
+    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_SHx_RI)
+        return true;
     /*
      * Keep the expanded level-2 instruction set disabled for now.  Enabling
      * the rest of ALU/CMP/TEST/NEG/Jcc still WDTs during SeaBIOS relocation on
@@ -1546,8 +1611,6 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
      * mismatch around lazy flags or block-boundary control flow, so fall back
      * to the known-safe level-2 whitelist above.
      */
-    /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NEG_R)
-        return true; */
     /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CMP_RR)
         return true; */
     /* if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CMP_RI)

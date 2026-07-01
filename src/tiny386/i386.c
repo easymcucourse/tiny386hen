@@ -5598,9 +5598,15 @@ _Static_assert(offsetof(struct CPUI386, cc.mask) == JIT_CC_MASK_OFF, "JIT_CC_MAS
 _Static_assert(CC_ADD == JIT_CC_ADD, "CC_ADD mismatch");
 _Static_assert(CC_SUB == JIT_CC_SUB, "CC_SUB mismatch");
 _Static_assert(CC_NEG32 == JIT_CC_NEG32, "CC_NEG32 mismatch");
+_Static_assert(CC_DEC32 == JIT_CC_DEC32, "CC_DEC32 mismatch");
+_Static_assert(CC_INC32 == JIT_CC_INC32, "CC_INC32 mismatch");
+_Static_assert(CC_SAR == JIT_CC_SAR, "CC_SAR mismatch");
+_Static_assert(CC_SHL == JIT_CC_SHL, "CC_SHL mismatch");
+_Static_assert(CC_SHR == JIT_CC_SHR, "CC_SHR mismatch");
 _Static_assert(CC_AND == JIT_CC_AND, "CC_AND mismatch");
 _Static_assert(CC_OR == JIT_CC_OR, "CC_OR mismatch");
 _Static_assert(CC_XOR == JIT_CC_XOR, "CC_XOR mismatch");
 _Static_assert((CF | PF | AF | ZF | SF | OF) == JIT_CC_MASK_ARITH, "JIT_CC_MASK_ARITH mismatch");
+_Static_assert((PF | AF | ZF | SF | OF) == JIT_CC_MASK_ARITH_NO_CF, "JIT_CC_MASK_ARITH_NO_CF mismatch");
 _Static_assert((CF | PF | ZF | SF | OF) == JIT_CC_MASK_LOGIC, "JIT_CC_MASK_LOGIC mismatch");
 #endif

@@ -81,12 +81,18 @@ typedef struct FPU FPU;
 #define JIT_CC_ADD          1
 #define JIT_CC_SUB          3
 #define JIT_CC_NEG32        6
+#define JIT_CC_DEC32        9
+#define JIT_CC_INC32        12
+#define JIT_CC_SAR          19
+#define JIT_CC_SHL          20
+#define JIT_CC_SHR          21
 #define JIT_CC_AND          26
 #define JIT_CC_OR           27
 #define JIT_CC_XOR          28
 
 /* CPUI386 cc.mask values (arithmetic vs logical). */
 #define JIT_CC_MASK_ARITH   0x8D5
+#define JIT_CC_MASK_ARITH_NO_CF 0x8D4
 #define JIT_CC_MASK_LOGIC   0x8C5
 
 /* ------------------------------------------------------------------ */
