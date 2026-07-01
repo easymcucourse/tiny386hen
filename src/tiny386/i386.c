@@ -7,9 +7,10 @@
 
 #ifdef BUILD_ESP32
 #include "esp_attr.h"
+#include "esp_heap_caps.h"
 #include "timestamp_stdio.h"
 #ifdef TINY386_ENABLE_JIT
-#include "jit_lx7.h"
+#include "jit_x86.h"
 #endif
 #define noinline __attribute__((noinline))
 #else
@@ -5340,9 +5341,10 @@ u8 *cpui386_get_phys_mem(CPUI386 *cpu)
 	return cpu->phys_mem;
 }
 
-CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
+static CPUI386 *cpui386_init_allocated(CPUI386 *cpu, int gen, char *phys_mem,
+					long phys_mem_size, CPU_CB **cb,
+					bool defer_tlb)
 {
-	CPUI386 *cpu = malloc(sizeof(CPUI386));
 	switch (gen) {
 	case 3: cpu->flags_mask = EFLAGS_MASK_386; break;
 	case 4: cpu->flags_mask = EFLAGS_MASK_486; break;
@@ -5352,17 +5354,19 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	cpu->gen = gen;
 
 	cpu->tlb.size = tlb_size;
+	if (!defer_tlb) {
 #ifdef BUILD_ESP32
-	{
-		extern void *pcmalloc(long size);
-		size_t tlb_bytes = sizeof(struct tlb_entry) * tlb_size;
-		cpu->tlb.tab = malloc(tlb_bytes);
-		if (!cpu->tlb.tab)
-			cpu->tlb.tab = pcmalloc(tlb_bytes);
-	}
+		{
+			extern void *pcmalloc(long size);
+			size_t tlb_bytes = sizeof(struct tlb_entry) * tlb_size;
+			cpu->tlb.tab = malloc(tlb_bytes);
+			if (!cpu->tlb.tab)
+				cpu->tlb.tab = pcmalloc(tlb_bytes);
+		}
 #else
-	cpu->tlb.tab = malloc(sizeof(struct tlb_entry) * tlb_size);
+		cpu->tlb.tab = malloc(sizeof(struct tlb_entry) * tlb_size);
 #endif
+	}
 
 	cpu->phys_mem = (u8 *) phys_mem;
 	cpu->phys_mem_size = phys_mem_size;
@@ -5384,6 +5388,43 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 		*cb = &(cpu->cb);
 	return cpu;
 }
+
+CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
+{
+	CPUI386 *cpu = malloc(sizeof(CPUI386));
+	if (!cpu)
+		return NULL;
+	return cpui386_init_allocated(cpu, gen, phys_mem, phys_mem_size, cb, false);
+}
+
+#if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
+CPUI386 *cpui386_new_internal(int gen, char *phys_mem, long phys_mem_size)
+{
+	CPUI386 *cpu = heap_caps_malloc(sizeof(CPUI386),
+					MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+	size_t tlb_bytes = sizeof(struct tlb_entry) * tlb_size;
+	void *tlb = heap_caps_malloc(tlb_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+	if (!cpu || !tlb) {
+		free(cpu);
+		free(tlb);
+		return NULL;
+	}
+	cpu->tlb.size = tlb_size;
+	cpu->tlb.tab = tlb;
+	return cpui386_init_allocated(cpu, gen, phys_mem, phys_mem_size, NULL, true);
+}
+
+void cpui386_delete_internal(CPUI386 *cpu)
+{
+	if (!cpu)
+		return;
+	if (cpu->fpu)
+		fpu_delete(cpu->fpu);
+	free(cpu->tlb.tab);
+	free(cpu);
+}
+#endif
 
 void cpui386_enable_fpu(CPUI386 *cpu)
 {
@@ -5468,8 +5509,84 @@ static void cpu_debug(CPUI386 *cpu)
 }
 
 #if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
-#include "jit_lx7.h"
+#include "jit_x86.h"
+#include "jit_selftest.h"
 #include <stddef.h>
+
+void jit_cpu_snapshot(CPUI386 *cpu, JITCpuSnapshot *snap)
+{
+	for (int i = 0; i < 8; i++)
+		snap->gpr[i] = REGi(i);
+	snap->ip = cpu->ip;
+	snap->next_ip = cpu->next_ip;
+	snap->flags = cpu_getflags(cpu);
+}
+
+void jit_cpu_restore(CPUI386 *cpu, const JITCpuSnapshot *snap)
+{
+	for (int i = 0; i < 8; i++)
+		REGi(i) = snap->gpr[i];
+	cpu->ip = snap->ip;
+	cpu->next_ip = snap->next_ip;
+	cpu->flags = snap->flags;
+	cpu->cc.mask = 0;
+	cpu->ifetch.paddr = 0;
+}
+
+uint32_t jit_cpu_get_gpr(CPUI386 *cpu, int reg)
+{
+	return REGi(reg);
+}
+
+int jit_cpu_step_interp(CPUI386 *cpu, int stepcount)
+{
+	if (cpu->halt)
+		return 0;
+
+	int ret = cpu_exec1(cpu, stepcount);
+	cpu->ifetch.paddr = 0;
+	if (!ret) {
+		cpu->next_ip = cpu->ip;
+		return 0;
+	}
+	cpu->ip = cpu->next_ip;
+	return stepcount;
+}
+
+int jit_cpu_step_jit(CPUI386 *cpu, int max_insns)
+{
+	int total = 0;
+
+	while (total < max_insns) {
+		if (cpu->halt)
+			break;
+		int consumed = jit_try_execute(&cpu->jit, cpu);
+		if (consumed <= 0)
+			break;
+		total += consumed;
+		cpu->cycle += consumed;
+		cpu->ip = cpu->next_ip;
+		cpu->ifetch.paddr = 0;
+	}
+	return total;
+}
+
+void jit_cpu_prepare_exec(CPUI386 *cpu, uint32_t ip)
+{
+	cpu->ip = ip;
+	cpu->next_ip = ip;
+	cpu->ifetch.paddr = 0;
+}
+
+void jit_cpu_invalidate_cache(CPUI386 *cpu)
+{
+	jit_invalidate_all(&cpu->jit);
+}
+
+_Static_assert(offsetof(struct CPUI386, gprx[0].r32) == 0,  "GPR_OFF(0) mismatch: gprx[0] not at offset 0");
+_Static_assert(offsetof(struct CPUI386, gprx[1].r32) == 4,  "GPR_OFF(1) mismatch");
+_Static_assert(offsetof(struct CPUI386, gprx[7].r32) == 28, "GPR_OFF(7) mismatch");
+_Static_assert(offsetof(struct CPUI386, next_ip)     == 36, "NEXT_IP_OFF mismatch: expected 36");
 _Static_assert(offsetof(struct CPUI386, cc.op)   == JIT_CC_OP_OFF,   "JIT_CC_OP_OFF mismatch");
 _Static_assert(offsetof(struct CPUI386, cc.dst)  == JIT_CC_DST_OFF,  "JIT_CC_DST_OFF mismatch");
 _Static_assert(offsetof(struct CPUI386, cc.dst2) == JIT_CC_DST2_OFF, "JIT_CC_DST2_OFF mismatch");

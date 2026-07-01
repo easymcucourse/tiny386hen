@@ -33,14 +33,12 @@
 
 /* Run more x86 instructions per device poll to reduce interpreter overhead. */
 #define PC_STEP_COUNT 16384
-#define PC_PERF_LOG_ENABLED 0
+#define PC_PERF_LOG_ENABLED 1
 #define PC_PERF_LOG_INTERVAL_US 5000000u
 #define PC_CMOS_STEP_DIV 16
 #define PC_KBD_STEP_DIV 2
 #define PC_DMA_STEP_DIV 2
 #define PC_SERIAL_STEP_DIV 2
-#define TINY386_ENABLE_JIT 1
-#define TINY386_JIT_LEVEL 2
 
 /* Network is disabled on this board; omit NE2000 state and runtime work. */
 #define TINY386_NO_NE2000 1
@@ -72,6 +70,17 @@
  * Value: 4MB phys_mem + 320KB vga_mem + 256KB framebuffer + 256KB headroom.
  */
 #define PSRAM_ALLOC_LEN (5 * 1024 * 1024)
+
+/*
+ * Set to 1 for board JIT differential self-test only: skips LCD, I2S, SD, USB,
+ * and the PC emulator. Serial output uses esp_rom_printf (UART0).
+ */
+#define TINY386_JIT_SELFTEST_ONLY 0
+
+/*
+ * Run jit_selftest at i386_task entry (production boot path, no LCD/I2S/USB/SD).
+ */
+#define TINY386_JIT_SELFTEST_AT_BOOT 1
 
 /*
  * 2:1 downscale rendering so that VGA 80-column text mode (640×400 pixels

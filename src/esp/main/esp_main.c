@@ -23,6 +23,22 @@
 #include "debugcon.h"
 #include "startup_splash.h"
 #include "timestamp_stdio.h"
+#ifdef BUILD_ESP32
+#include "jit_selftest.h"
+#include "esp_rom_sys.h"
+#include "esp_task_wdt.h"
+#include "freertos/semphr.h"
+
+static void jit_selftest_run_blocking(void)
+{
+	int fail;
+
+	esp_task_wdt_delete(NULL);
+	fail = jit_selftest_run();
+	if (fail != 0)
+		esp_rom_printf("[jit_selftest] WARNING: %d case(s) failed\n", fail);
+}
+#endif
 
 #ifndef PC_PERF_LOG_INTERVAL_US
 #define PC_PERF_LOG_INTERVAL_US 1000000u
@@ -400,16 +416,24 @@ static void i386_task(void *arg)
 	struct esp_ini_config *config = arg;
 	int core_id = esp_cpu_get_core_id();
 	fprintf(stderr, "main runs on core %d\n", core_id);
-	/* Wait for LCD panel (and panel_fb) to be ready before starting the
-	 * PC emulator.  console_init() uses globals.panel_fb if set. */
+
 	xEventGroupWaitBits(global_event_group,
 	                    TINY386_EVENT_LOGO_READY,
 	                    pdFALSE,
 	                    pdFALSE,
 	                    portMAX_DELAY);
+#ifdef TINY386_JIT_SELFTEST_AT_BOOT
+	(void)config;
+	esp_rom_printf("[boot] JIT selftest (no LCD/I2S/USB/SD)\n");
+	jit_selftest_run_blocking();
+	esp_rom_printf("[boot] selftest finished, halting\n");
+	for (;;)
+		vTaskDelay(portMAX_DELAY);
+#else
 	fprintf(stderr, "[splash] logo ready, starting PC in background\n");
 	pc_main(config->filename);
 	vTaskDelete(NULL);
+#endif
 }
 
 static char *psram;
@@ -499,6 +523,16 @@ static int load_ini_from_partition(void)
 
 void app_main(void)
 {
+#ifdef TINY386_JIT_SELFTEST_ONLY
+	esp_psram_init();
+	esp_rom_printf("[boot] JIT selftest-only (no LCD/I2S/USB/SD)\n");
+#ifdef BUILD_ESP32
+	jit_selftest_run_blocking();
+#endif
+	esp_rom_printf("[boot] selftest finished, halting\n");
+	for (;;)
+		vTaskDelay(portMAX_DELAY);
+#else
 	global_event_group = xEventGroupCreate();
 
 #ifdef ESPDEBUG
@@ -517,11 +551,14 @@ void app_main(void)
 	}
 #endif
 
+#ifndef TINY386_JIT_SELFTEST_AT_BOOT
 	startup_resources_mount();
 	i2s_main();
 	storage_init();
+#endif
 
 	esp_psram_init();
+
 #ifndef PSRAM_ALLOC_LEN
 	// use the whole psram
 	size_t len;
@@ -566,12 +603,21 @@ void app_main(void)
 	}
 
 	if (config.enable_usb) {
+#ifndef TINY386_JIT_SELFTEST_AT_BOOT
 		usb_setup();
+#endif
 	}
 
 	if (psram) {
+#ifdef TINY386_JIT_SELFTEST_AT_BOOT
 		debugcon_init();
-		xTaskCreatePinnedToCore(i386_task, "i386_main", 8192, &config, 3, NULL, 1);
+		xEventGroupSetBits(global_event_group, TINY386_EVENT_LOGO_READY);
+		xTaskCreatePinnedToCore(i386_task, "i386_main", 16384, &config, 3, NULL, 1);
+#else
+		debugcon_init();
+		xTaskCreatePinnedToCore(i386_task, "i386_main", 16384, &config, 3, NULL, 1);
 		xTaskCreatePinnedToCore(vga_task, "vga_task", 4096, NULL, 0, NULL, 0);
+#endif
 	}
+#endif /* !TINY386_JIT_SELFTEST_ONLY */
 }

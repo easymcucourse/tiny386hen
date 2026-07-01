@@ -7,11 +7,11 @@ set(TINY386_CORE_SOURCES
     "${TINY386_REF_ROOT}/fpu.c"
     "${TINY386_OVERLAY_ROOT}/i386.c"
     "${TINY386_ESP_SRC_ROOT}/jit_lx7.c"
-    "${TINY386_ESP_SRC_ROOT}/jit_lx7_mov_rr.S"
+    "${TINY386_ESP_SRC_ROOT}/jit_selftest.c"
     "${TINY386_REF_ROOT}/i8042.c"
     "${TINY386_REF_ROOT}/i8254.c"
     "${TINY386_REF_ROOT}/i8259.c"
-    "${TINY386_OVERLAY_ROOT}/ide.c"
+    "${TINY386_REF_ROOT}/ide.c"
     "${TINY386_REF_ROOT}/ini.c"
     "${TINY386_OVERLAY_ROOT}/pc.c"
     "${TINY386_REF_ROOT}/misc.c"
@@ -46,9 +46,7 @@ idf_component_register(
         "${EMU8950_SRC_ROOT}"
     REQUIRES
         driver
-        esp_driver_gpio
-        esp_driver_i2s
-        esp_driver_spi
+        esp_mm
         esp_lcd
         esp_partition
         esp_psram
@@ -68,6 +66,9 @@ message(STATUS "Using emu8950 sources from ${EMU8950_SRC_ROOT}")
 add_definitions(-include ${TINY386_ESP_SRC_ROOT}/board_${BOARD}.h)
 add_definitions(-DI386_ENABLE_FPU)
 
+# JIT: enable on ESP32 only via per-source compile flags (level 1 = NOP-only baseline).
+set(TINY386_JIT_COMPILE_FLAGS "-DTINY386_ENABLE_JIT -DTINY386_JIT_LEVEL=1")
+
 target_link_options(${COMPONENT_LIB} INTERFACE
     -Wl,--wrap=sdmmc_init_spi_crc
     -Wl,--undefined=__wrap_sdmmc_init_spi_crc
@@ -86,8 +87,9 @@ set_source_files_properties("${TINY386_ESP_SRC_ROOT}/adlib.c" PROPERTIES COMPILE
 set_source_files_properties("${EMU8950_SRC_ROOT}/emu8950.c" PROPERTIES COMPILE_FLAGS "-Wno-all -fsingle-precision-constant")
 set_source_files_properties("${EMU8950_SRC_ROOT}/emuadpcm.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_REF_ROOT}/fpu.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
-set_source_files_properties("${TINY386_OVERLAY_ROOT}/i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
-set_source_files_properties("${TINY386_ESP_SRC_ROOT}/jit_lx7.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
+set_source_files_properties("${TINY386_OVERLAY_ROOT}/i386.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 ${TINY386_JIT_COMPILE_FLAGS}")
+set_source_files_properties("${TINY386_ESP_SRC_ROOT}/jit_lx7.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 ${TINY386_JIT_COMPILE_FLAGS}")
+set_source_files_properties("${TINY386_ESP_SRC_ROOT}/jit_selftest.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3 ${TINY386_JIT_COMPILE_FLAGS}")
 set_source_files_properties("${TINY386_REF_ROOT}/i8042.c" PROPERTIES COMPILE_FLAGS "-Wno-all")
 set_source_files_properties("${TINY386_ESP_SRC_ROOT}/vga.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")
 set_source_files_properties("${TINY386_OVERLAY_ROOT}/pc.c" PROPERTIES COMPILE_FLAGS "-Wno-all -O3")

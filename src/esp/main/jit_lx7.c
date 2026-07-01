@@ -19,8 +19,8 @@
  *
  *  RRI8 format (ADDI, L32I, S32I, BEQ, BNE, BLT, BGE, BLTU, BGEU)
  *    byte[2] = imm8
- *    byte[1] = (s << 4) | t
- *    byte[0] = opbyte                  encodes op-sub and op0
+ *    byte[1] = (op_sub << 4) | s
+ *    byte[0] = (t << 4) | op0
  *
  *  RI  format  (MOVI, BEQZ, BNEZ, BLTZ, BGEZ)
  *    byte[2] = imm[11:4]
@@ -39,8 +39,98 @@
 
 #include <string.h>
 #include <stddef.h>
+#include <stdint.h>
 
-extern const uint8_t jit_lx7_mov_rr_a3_a10[8][8][2];
+#ifndef BUILD_ESP32
+#error "jit_lx7.c requires BUILD_ESP32"
+#endif
+
+#include "sdkconfig.h"
+
+#if !defined(CONFIG_SPIRAM) || !CONFIG_SPIRAM
+#error "jit_lx7.c requires CONFIG_SPIRAM=1"
+#endif
+
+#include "esp_attr.h"
+#include "esp_cache.h"
+#include "esp_heap_caps.h"
+#include "esp_mmu_map.h"
+#include "esp_rom_sys.h"
+#include "hal/mmu_types.h"
+
+static uint8_t *s_jit_pool_write;
+static uint8_t *s_jit_pool_exec;
+static bool     s_jit_pool_psram;
+static bool     s_jit_pool_tried;
+
+static uint8_t *jit_pool_exec_for(const uint8_t *write_ptr)
+{
+    if (!write_ptr)
+        return NULL;
+    if (s_jit_pool_psram && s_jit_pool_write && s_jit_pool_exec)
+        return s_jit_pool_exec + (write_ptr - s_jit_pool_write);
+    return NULL;
+}
+
+static uint8_t *jit_acquire_pool(void)
+{
+    if (!s_jit_pool_tried) {
+        s_jit_pool_tried = true;
+        s_jit_pool_write = (uint8_t *)heap_caps_aligned_alloc(
+            CONFIG_MMU_PAGE_SIZE,
+            JIT_POOL_SIZE,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_jit_pool_write) {
+            esp_paddr_t  paddr  = 0;
+            mmu_target_t target = 0;
+            if (esp_mmu_vaddr_to_paddr(s_jit_pool_write, &paddr, &target) == ESP_OK
+                && target == MMU_TARGET_PSRAM0) {
+                void *exec = NULL;
+                esp_err_t err = esp_mmu_map(
+                    paddr,
+                    JIT_POOL_SIZE,
+                    MMU_TARGET_PSRAM0,
+                    MMU_MEM_CAP_EXEC | MMU_MEM_CAP_READ | MMU_MEM_CAP_32BIT,
+                    ESP_MMU_MMAP_FLAG_PADDR_SHARED,
+                    &exec);
+                if (err == ESP_OK && exec) {
+                    s_jit_pool_exec = (uint8_t *)exec;
+                    s_jit_pool_psram = true;
+                    /* Pre-invalidate I-cache for the entire exec region
+                     * to clear stale lines from prior mappings. */
+                    esp_cache_msync(exec, JIT_POOL_SIZE,
+                                    ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                                    ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+                    __asm__ __volatile__("isync" ::: "memory");
+                } else {
+                    esp_rom_printf("[jit] psram exec map err=%d\n", (int)err);
+                    heap_caps_free(s_jit_pool_write);
+                    s_jit_pool_write = NULL;
+                }
+            } else {
+                esp_rom_printf("[jit] psram vaddr->paddr failed\n");
+                heap_caps_free(s_jit_pool_write);
+                s_jit_pool_write = NULL;
+            }
+        }
+        esp_rom_printf("[jit] pool write=%p exec=%p psram=%d\n",
+                       (void *)s_jit_pool_write,
+                       (void *)s_jit_pool_exec,
+                       (int)s_jit_pool_psram);
+    }
+    return s_jit_pool_write;
+}
+
+#define JIT_DEFAULT_POOL (jit_acquire_pool())
+
+bool jit_pool_ready(void)
+{
+    uint8_t *pool = jit_acquire_pool();
+    bool ready = (pool != NULL) && s_jit_pool_psram && (s_jit_pool_exec != NULL);
+    if (!ready)
+        esp_rom_printf("[jit] PSRAM exec pool unavailable — JIT disabled\n");
+    return ready;
+}
 
 #ifndef TINY386_JIT_LEVEL
 #define TINY386_JIT_LEVEL 0
@@ -69,19 +159,6 @@ extern const uint8_t jit_lx7_mov_rr_a3_a10[8][8][2];
 
 #ifndef TINY386_JIT_JMP_SINGLE_BLOCK
 #define TINY386_JIT_JMP_SINGLE_BLOCK 1
-#endif
-
-#ifndef TINY386_JIT_USE_MOV_N
-#define TINY386_JIT_USE_MOV_N 0
-#endif
-
-#ifdef BUILD_ESP32
-#  include "esp_attr.h"
-   /* Static IRAM pool – the linker places this in instruction-accessible RAM */
-   static uint32_t IRAM_ATTR s_jit_pool_words[(JIT_POOL_SIZE + 3) / 4];
-#  define JIT_DEFAULT_POOL ((uint8_t *)s_jit_pool_words)
-#else
-#  define JIT_DEFAULT_POOL NULL  /* JIT disabled on non-ESP32 targets */
 #endif
 
 /* ================================================================== */
@@ -149,21 +226,7 @@ static inline void emit_neg(EmitPtr *p, int r, int t)
 /* MOV ar, as  (implemented as OR ar, as, as) */
 static inline void emit_mov(EmitPtr *p, int r, int s)
 {
-#if TINY386_JIT_USE_MOV_N
-    if ((unsigned)(r - 3) < 8u && (unsigned)(s - 3) < 8u) {
-        const uint8_t *code = jit_lx7_mov_rr_a3_a10[r - 3][s - 3];
-        (*p)[0] = code[0];
-        (*p)[1] = code[1];
-        *p += 2;
-        return;
-    }
-
-    (*p)[0] = (uint8_t)((r << 4) | 0x0D);
-    (*p)[1] = (uint8_t)s;
-    *p += 2;
-#else
     emit_or(p, r, s, s);
-#endif
 }
 
 /* SSL as  — load SAR = (32 - as) for left shifts */
@@ -227,57 +290,55 @@ static inline void emit_srai(EmitPtr *p, int r, int t, int sa)
 
 /* ---- RRI8 format helpers ---------------------------------------- */
 
+static inline void emit_rri8(EmitPtr *p, int op_sub, int t, int s, int op0, int imm8)
+{
+    (*p)[0] = (uint8_t)((t << 4) | op0);
+    (*p)[1] = (uint8_t)((op_sub << 4) | s);
+    (*p)[2] = (uint8_t)(imm8 & 0xFF);
+    *p += 3;
+}
+
 /* ADDI at, as, simm8  (sign-extended 8-bit immediate) */
 static inline void emit_addi(EmitPtr *p, int t, int s, int imm8)
 {
-    (*p)[0] = 0xC2;                           /* op_sub=0xC, op0=0x2 */
-    (*p)[1] = (uint8_t)((s << 4) | t);
-    (*p)[2] = (uint8_t)(imm8 & 0xFF);
-    *p += 3;
+    emit_rri8(p, 0xC, t, s, 0x2, imm8);
 }
 
 /* L32I at, as, off8  (off8 is byte-offset/4, so actual_offset = off8<<2) */
 static inline void emit_l32i(EmitPtr *p, int t, int s, int off8)
 {
-    (*p)[0] = 0x22;                           /* op_sub=0x2, op0=0x2 */
-    (*p)[1] = (uint8_t)((s << 4) | t);
-    (*p)[2] = (uint8_t)(off8 & 0xFF);
-    *p += 3;
+    emit_rri8(p, 0x2, t, s, 0x2, off8);
 }
 
 /* S32I at, as, off8  (stores at to mem[as + off8<<2]) */
 static inline void emit_s32i(EmitPtr *p, int t, int s, int off8)
 {
-    (*p)[0] = 0x62;                           /* op_sub=0x6, op0=0x2 */
-    (*p)[1] = (uint8_t)((s << 4) | t);
-    (*p)[2] = (uint8_t)(off8 & 0xFF);
-    *p += 3;
+    emit_rri8(p, 0x6, t, s, 0x2, off8);
 }
 
 /* Two-register compare-and-branch (RRI8, offset = signed byte delta) */
-/*   BEQ  as, at, off8 */
 static inline void emit_beq(EmitPtr *p, int s, int t, int off8)
-{ (*p)[0]=0x17; (*p)[1]=(uint8_t)((s<<4)|t); (*p)[2]=(uint8_t)off8; *p+=3; }
+{ emit_rri8(p, 0x1, t, s, 0x7, off8); }
 
 /*   BNE  as, at, off8 */
 static inline void emit_bne(EmitPtr *p, int s, int t, int off8)
-{ (*p)[0]=0x97; (*p)[1]=(uint8_t)((s<<4)|t); (*p)[2]=(uint8_t)off8; *p+=3; }
+{ emit_rri8(p, 0x9, t, s, 0x7, off8); }
 
 /*   BLT  as, at, off8  (signed) */
 static inline void emit_blt(EmitPtr *p, int s, int t, int off8)
-{ (*p)[0]=0x27; (*p)[1]=(uint8_t)((s<<4)|t); (*p)[2]=(uint8_t)off8; *p+=3; }
+{ emit_rri8(p, 0x2, t, s, 0x7, off8); }
 
 /*   BGE  as, at, off8  (signed) */
 static inline void emit_bge(EmitPtr *p, int s, int t, int off8)
-{ (*p)[0]=0xA7; (*p)[1]=(uint8_t)((s<<4)|t); (*p)[2]=(uint8_t)off8; *p+=3; }
+{ emit_rri8(p, 0xA, t, s, 0x7, off8); }
 
 /*   BLTU as, at, off8  (unsigned) */
 static inline void emit_bltu(EmitPtr *p, int s, int t, int off8)
-{ (*p)[0]=0x37; (*p)[1]=(uint8_t)((s<<4)|t); (*p)[2]=(uint8_t)off8; *p+=3; }
+{ emit_rri8(p, 0x3, t, s, 0x7, off8); }
 
 /*   BGEU as, at, off8  (unsigned) */
 static inline void emit_bgeu(EmitPtr *p, int s, int t, int off8)
-{ (*p)[0]=0xB7; (*p)[1]=(uint8_t)((s<<4)|t); (*p)[2]=(uint8_t)off8; *p+=3; }
+{ emit_rri8(p, 0xB, t, s, 0x7, off8); }
 
 /* ---- RI format: zero-compare branches (offset = signed 12-bit) -- */
 /*   BEQZ as, imm12 */
@@ -291,7 +352,7 @@ static inline void emit_beqz(EmitPtr *p, int s, int imm12)
 /*   BNEZ as, imm12 */
 static inline void emit_bnez(EmitPtr *p, int s, int imm12)
 {
-    (*p)[0] = 0x26;
+    (*p)[0] = 0x56;
     (*p)[1] = (uint8_t)(((imm12 & 0xF) << 4) | s);
     (*p)[2] = (uint8_t)((imm12 >> 4) & 0xFF);
     *p += 3;
@@ -299,7 +360,7 @@ static inline void emit_bnez(EmitPtr *p, int s, int imm12)
 /*   BLTZ as, imm12  (branch if as < 0, i.e. sign-flag set) */
 static inline void emit_bltz(EmitPtr *p, int s, int imm12)
 {
-    (*p)[0] = 0x56;
+    (*p)[0] = 0x96;
     (*p)[1] = (uint8_t)(((imm12 & 0xF) << 4) | s);
     (*p)[2] = (uint8_t)((imm12 >> 4) & 0xFF);
     *p += 3;
@@ -354,12 +415,10 @@ static void emit_ssri_wide(EmitPtr *p, int r, int sa)
     emit_srl(p,  r, r);
 }
 
-/* ---- RET0: return from CALL0-called function -------------------- */
+/* ---- RETW.N: windowed return ------------------------------------- */
 static inline void emit_retw(EmitPtr *p)
 {
-    /* JX a0  — jump to the address stored in a0 (the return address) */
-    /* op2=0, op1=0xA, r=0, s=0 (a0), t=0; op0=0  → RRR             */
-    /* From ISA: JX at is op2=0 & op1=0xA & at & ar=0 & as=0 & op0=0 */
+    /* RETW.N — narrow windowed return: encoding 0x1D 0xF0            */
     (*p)[0] = 0x1D;
     (*p)[1] = 0xF0;
     *p += 2;
@@ -367,6 +426,7 @@ static inline void emit_retw(EmitPtr *p)
 
 static inline void emit_entry32(EmitPtr *p)
 {
+    /* ENTRY a1, 32 — windowed ABI prologue (allocates 32-byte frame) */
     (*p)[0] = 0x36;
     (*p)[1] = 0x41;
     (*p)[2] = 0x00;
@@ -425,7 +485,7 @@ static int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
 
     /* Back-patch L32R: EA = ((PC + 3) & ~3) + (sign_extend16(imm16) << 2). */
     uintptr_t aligned_pc = ((uintptr_t)pc_l32r + 3) & ~(uintptr_t)3;
-    int32_t l32r_imm16 = (int32_t)(((uintptr_t)pool - aligned_pc) / 4);
+    int32_t l32r_imm16 = (int32_t)(((intptr_t)pool - (intptr_t)aligned_pc) / 4);
     pc_l32r[0] = (uint8_t)((t << 4) | 0x1);
     pc_l32r[1] = (uint8_t)(l32r_imm16 & 0xFF);
     pc_l32r[2] = (uint8_t)((l32r_imm16 >> 8) & 0xFF);
@@ -436,19 +496,21 @@ static int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
 /* ================================================================== */
 /*  Section 2 — Block Prologue / Epilogue                             */
 /*                                                                     */
-/*  Calling convention: CALL0 (no register-window rotation)           */
-/*    a0  = return address (set by caller's CALL0 instruction)        */
-/*    a2  = CPUI386* (arg0, preserved throughout)                     */
+/*  Calling convention: windowed (ENTRY a1,32 + RETW.N)               */
+/*    Called from C via normal function pointer (compiler uses CALL8). */
+/*    a0  = return address (set by CALL8, used by RETW.N)             */
+/*    a1  = SP (adjusted by ENTRY)                                    */
+/*    a2  = CPUI386* (arg0, preserved throughout block)               */
 /*    a3  = EAX, a4 = ECX, a5 = EDX, a6 = EBX                        */
 /*    a7  = ESP, a8 = EBP, a9 = ESI, a10 = EDI                       */
-/*    a11-a13 = temporaries (used for flag computation)               */
+/*    a11-a13 = temporaries (flags/literals)                          */
 /* ================================================================== */
 
 /* Byte offset of gprx[i].r32 in CPUI386 (struct starts with gprx[8]) */
 #define GPR_OFF(i)  ((i) * 4)           /* 0, 4, 8, … 28 */
 #define NEXT_IP_OFF (8 * 4 + 4)         /* gprx[8]*4 bytes + ip(4) = 36 */
 
-/* Emit prologue: load all 8 x86 GPRs from cpu->gprx[] */
+/* Emit prologue: ENTRY + load all 8 x86 GPRs from cpu->gprx[] */
 static void emit_prologue(EmitPtr *p, int cpu_reg)
 {
     emit_entry32(p);
@@ -458,7 +520,7 @@ static void emit_prologue(EmitPtr *p, int cpu_reg)
     }
 }
 
-/* Emit epilogue: store all 8 x86 GPRs back, set next_ip, return */
+/* Emit epilogue: store all 8 x86 GPRs back, set next_ip, RETW.N */
 static void emit_epilogue(EmitPtr *p, int cpu_reg, uint32_t next_ip)
 {
     for (int i = 0; i < 8; i++) {
@@ -560,6 +622,9 @@ typedef struct {
     uint32_t   target_eip; /* for JMP/JCC: resolved target EIP */
     bool       flags_dead;
 } X86Action;
+
+static X86Action s_jit_scan_actions[JIT_SCAN_LIMIT];
+static uint8_t   s_jit_scan_action_bytes[JIT_SCAN_LIMIT];
 
 /*
  * Decode one x86 instruction (32-bit mode, register operands only).
@@ -883,13 +948,11 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     /* ---- MOV ------------------------------------------------ */
     case ACT_MOV_RR:
         /*
-         * Failed as a runtime action, not as an Xtensa encoding problem.
-         * mov.n encodings were checked against jit_lx7_mov_rr.S, but the
-         * firmware still hit WDT in level2 MOV_RR-only testing. Keep this
-         * emitter for controlled experiments only until the state mismatch is
-         * found with translation/execution tracing.
+         * Failed as a runtime action in level2 MOV_RR-only testing. Keep the
+         * stable 3-byte OR-based move for controlled experiments until the
+         * state mismatch is found with translation/execution tracing.
          */
-        GUARD(2); emit_mov(p, dr, sr); break;
+        GUARD(3); emit_mov(p, dr, sr); break;
 
     case ACT_MOV_RI:
         GUARD(16); emit_movi32(p, dr, (uint32_t)a->imm); break;
@@ -1160,8 +1223,8 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         /* Taken epilogue */
         emit_epilogue(p, cpu_reg, a->target_eip);
 
-        /* Back-patch branch: offset = (taken_start - (branch_site+3)) */
-        int32_t br_off = (int32_t)(taken_start - (branch_site + 3));
+        /* Xtensa 3-byte branch displacement is relative to PC+4. */
+        int32_t br_off = (int32_t)(taken_start - (branch_site + 4));
 
         EmitPtr bp = branch_site;
         int lx7l = cs->cmp_lreg;
@@ -1301,6 +1364,18 @@ static bool jit_action_ends_block(const X86Action *a)
     return a->type == ACT_JMP || a->type == ACT_JCC || a->type == ACT_BLOCK_END;
 }
 
+static uint32_t s_jit_selftest_allow;
+
+void jit_selftest_set_allowed_actions(uint32_t mask)
+{
+    s_jit_selftest_allow = mask;
+}
+
+void jit_selftest_clear_allowed_actions(void)
+{
+    s_jit_selftest_allow = 0;
+}
+
 static bool jit_action_enabled(const X86Action *a, int block_insn_index)
 {
     /*
@@ -1309,18 +1384,17 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
      *   ACT_NOP:
      *     Passed a 30s serial smoke test. The guest reached hard-disk boot and
      *     VGA mode 1 without WDT. This proves the call path, entry/retw ABI,
-     *     basic prologue/epilogue, IRAM copy, and next_ip advance can work.
+     *     basic prologue/epilogue, code commit, and next_ip advance can work.
      *
      *   ACT_MOV_RI:
      *     Earlier level1 tests were stable, but it has not been re-tested after
-     *     the later entry/retw, IRAM copy, and emitter changes. Re-test as a
+     *     the later entry/retw, PSRAM pool, and emitter changes. Re-test as a
      *     single enabled action before treating it as a baseline.
      *
      *   ACT_MOV_RR:
      *     Failed in level2 and MOV_RR-only tests with WDT after the SeaBIOS
-     *     PCI/MPTABLE area. The Xtensa mov.n bytes were verified with the
-     *     assembler table in jit_lx7_mov_rr.S, so this is probably not a simple
-     *     instruction encoding bug. Needs execution tracing/state comparison.
+     *     PCI/MPTABLE area. The emitter now uses the stable 3-byte OR-based
+     *     move path, so this still needs execution tracing/state comparison.
      *
      *   ACT_JMP:
      *     Failed in JMP-only tests, usually during "Relocating init ...".
@@ -1339,8 +1413,13 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
      */
     (void)block_insn_index;
 
+    if (s_jit_selftest_allow != 0)
+        return ((s_jit_selftest_allow >> (unsigned)a->type) & 1u) != 0;
+
     if (TINY386_JIT_LEVEL <= 0)
         return false;
+    if (TINY386_JIT_LEVEL >= 1 && a->type == ACT_NOP)
+        return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NOT_R)
         return true;
     if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CWDE)
@@ -1381,35 +1460,43 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
     return false;
 }
 
-#ifdef BUILD_ESP32
-static void jit_copy_to_iram(uint8_t *dst, const uint8_t *src, uint32_t len)
+/*
+ * Commit generated code into the JIT pool.
+ * ESP32-S3 uses only the verified PSRAM dual mapping:
+ *   write alias (DBUS/D-cache) -> exec alias (IBUS/I-cache).
+ * The old IRAM/DIRAM write paths are intentionally abandoned because MEMPROT
+ * makes IRAM effectively RX and repeated board tests hit CACHEERR.
+ */
+static void __attribute__((noinline))
+jit_commit_code(uint8_t *dst, const uint8_t *src, uint32_t len)
 {
-    volatile uint32_t *dw = (volatile uint32_t *)dst;
-    uint32_t words = jit_align4(len) / 4;
-    for (uint32_t i = 0; i < words; i++) {
-        uint32_t off = i * 4;
-        uint32_t v = 0;
-        if (off + 0 < len)
-            v |= (uint32_t)src[off + 0];
-        if (off + 1 < len)
-            v |= (uint32_t)src[off + 1] << 8;
-        if (off + 2 < len)
-            v |= (uint32_t)src[off + 2] << 16;
-        if (off + 3 < len)
-            v |= (uint32_t)src[off + 3] << 24;
-        dw[i] = v;
-    }
+    if (!len)
+        return;
+
+    if (!s_jit_pool_psram || !s_jit_pool_write || !s_jit_pool_exec)
+        return;
+
+    memcpy(dst, src, len);
+    /* Step 1: Writeback D-cache → PSRAM */
+    esp_cache_msync(dst, len,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M |
+                    ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    /* Step 2: Invalidate I-cache for the exec alias so it re-fetches */
+    uint8_t *exec_ptr = jit_pool_exec_for(dst);
+    uint32_t line_mask = 31u; /* I-cache line = 32 bytes */
+    uint8_t *inv_start = (uint8_t *)((uintptr_t)exec_ptr & ~(uintptr_t)line_mask);
+    size_t   inv_len   = ((size_t)(exec_ptr + len - inv_start) + line_mask) & ~(size_t)line_mask;
+    esp_cache_msync(inv_start, inv_len,
+                    ESP_CACHE_MSYNC_FLAG_DIR_M2C |
+                    ESP_CACHE_MSYNC_FLAG_TYPE_INST);
+    __asm__ __volatile__("isync" ::: "memory");
 }
-#endif
 
 void jit_init(JITState *jit, uint8_t *iram_pool)
 {
     memset(jit, 0, sizeof(*jit));
-#ifdef BUILD_ESP32
-    jit->pool = iram_pool ? iram_pool : JIT_DEFAULT_POOL;
-#else
-    jit->pool = iram_pool;
-#endif
+    (void)iram_pool; /* ESP32-S3 JIT now only supports the PSRAM dual-map pool. */
+    jit->pool = JIT_DEFAULT_POOL;
 }
 
 void jit_invalidate_all(JITState *jit)
@@ -1442,12 +1529,11 @@ void jit_invalidate_page(JITState *jit, uint32_t paddr)
     }
 }
 
+IRAM_ATTR
 JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 {
     if (!jit->pool)
         return NULL;
-
-    /* Only handle 32-bit protected mode */
     if (cpui386_is_code16(cpu))
         return NULL;
 
@@ -1498,8 +1584,22 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         jit_invalidate_all(jit);
     }
 
-    uint8_t  *pool_start = jit->pool + jit->pool_used;
+    uint8_t  *pool_raw = jit->pool + jit->pool_used;
     uint8_t   tmp_code[JIT_BLOCK_MAXBYTES] __attribute__((aligned(4)));
+    /*
+     * pool_write = writable PSRAM data vaddr.
+     * pool_exec  = instruction-fetch PSRAM exec vaddr.
+     */
+    uint8_t  *pool_write = pool_raw;
+    uint8_t  *pool_exec  = jit_pool_exec_for(pool_raw);
+    if (!pool_exec) {
+        block->status = JIT_EMPTY;
+        return NULL;
+    }
+    if (jit->hits == 0 && jit->misses == 0) {
+        esp_rom_printf("[jit] translate: raw=%p write=%p exec=%p tmp=%p psram=%d\n",
+                       pool_raw, pool_write, pool_exec, tmp_code, (int)s_jit_pool_psram);
+    }
     uint8_t  *code_start = tmp_code;
     uint8_t  *code_end   = tmp_code + JIT_BLOCK_MAXBYTES;
     EmitPtr   p          = tmp_code;
@@ -1508,8 +1608,8 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     emit_prologue(&p, LX7_CPU_REG);
 
     /* Pass 1: Scan and decode all instructions in the block */
-    X86Action actions[JIT_SCAN_LIMIT];
-    uint8_t   action_bytes[JIT_SCAN_LIMIT];
+    X86Action *actions = s_jit_scan_actions;
+    uint8_t   *action_bytes = s_jit_scan_action_bytes;
     int       insn_count = 0;
     int       x86_consumed = 0;
     uint32_t  cur_eip = eip;
@@ -1647,7 +1747,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     block->guest_paddr  = paddr;
     block->guest_end    = paddr + (uint32_t)emitted_bytes;
     block->guest_cs_base= cs_base;
-    block->host_code    = pool_start;
+    block->host_code    = pool_exec;
     block->host_len     = (uint16_t)(p - code_start);
     block->x86_len      = (uint16_t)emitted_bytes;
     block->x86_insns    = (uint16_t)emitted_insns;
@@ -1656,9 +1756,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     block->bail         = JIT_BAIL_NONE;
     block->status       = JIT_VALID;
 
-#ifdef BUILD_ESP32
-    jit_copy_to_iram(pool_start, code_start, block->host_len);
-#endif
+    jit_commit_code(pool_write, code_start, block->host_len);
     jit->pool_used += jit_align4(block->host_len);
 
     return block;
@@ -1697,21 +1795,12 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
 
     jit->hits++;
 
-    /*
-     * Call the JIT block.  The block is a CALL0-compatible function:
-     *   void jit_block(CPUI386 *cpu);
-     * It reads/writes cpu->gprx[], updates cpu->next_ip, and returns.
-     *
-     * On ESP32 we invoke via a function pointer so GCC emits CALLX0.
-     * On other platforms this is a no-op (pool == NULL guard above).
-     */
-#ifdef BUILD_ESP32
     typedef void (*JITFunc)(CPUI386 *);
     JITFunc fn = (JITFunc)(void *)block->host_code;
+    if (jit->hits == 1) {
+        esp_rom_printf("[jit] exec @%p cpu=%p\n",
+                       (void *)fn, (void *)cpu);
+    }
     fn(cpu);
     return block->x86_insns;
-#else
-    (void)block;
-    return 0;
-#endif
 }
