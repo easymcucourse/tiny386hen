@@ -2590,7 +2590,8 @@ static void jit_dump_stats(const JITState *jit)
                    "block_exits=%u interp_exits=%u try_cycles=%llu "
                    "lookup_cycles=%llu translate_cycles=%llu "
                    "exec_cycles=%llu guest_ptr_cycles=%llu "
-                   "guest_scan_cycles=%llu guest_scan_bytes=%u\n",
+                   "guest_scan_cycles=%llu guest_scan_bytes=%u "
+                   "prestep_cooldown=%u prestep_cooldown_skips=%u\n",
                    (unsigned)jit->try_entries,
                    (unsigned)jit->block_entries,
                    (unsigned)jit->block_exits,
@@ -2601,7 +2602,9 @@ static void jit_dump_stats(const JITState *jit)
                    (unsigned long long)jit->exec_cycles,
                    (unsigned long long)jit->guest_ptr_cycles,
                    (unsigned long long)jit->guest_scan_cycles,
-                   (unsigned)jit->guest_scan_bytes);
+                   (unsigned)jit->guest_scan_bytes,
+                   (unsigned)jit->prestep_cooldown,
+                   (unsigned)jit->prestep_cooldown_skips);
     for (unsigned i = 1; i <= JIT_BAIL_POOL_FULL; i++) {
         if (jit->bail_counts[i] != 0) {
             esp_rom_printf("[jit_stats] bail %-20s %u\n",
@@ -2652,7 +2655,8 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
                    "interp_exits=%u try_cycles=%llu lookup_cycles=%llu "
                    "translate_cycles=%llu exec_cycles=%llu "
                    "guest_ptr_cycles=%llu guest_scan_cycles=%llu "
-                   "guest_scan_bytes=%u\n",
+                   "guest_scan_bytes=%u prestep_cooldown=%u "
+                   "prestep_cooldown_skips=%u\n",
                    phase ? phase : "boot",
                    (unsigned)ms, ips, cycles,
                    (unsigned)pc_steps, (unsigned)step_count,
@@ -2692,7 +2696,9 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
                    (unsigned long long)jit->exec_cycles,
                    (unsigned long long)jit->guest_ptr_cycles,
                    (unsigned long long)jit->guest_scan_cycles,
-                   (unsigned)jit->guest_scan_bytes);
+                   (unsigned)jit->guest_scan_bytes,
+                   (unsigned)jit->prestep_cooldown,
+                   (unsigned)jit->prestep_cooldown_skips);
     jit_dump_unsupported_opcodes(jit);
 }
 
@@ -3355,6 +3361,20 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         return 0;
     }
 
+#if TINY386_JIT_PRESTEP_COOLDOWN > 0
+#define JIT_SET_PRESTEP_COOLDOWN() \
+    do { jit->prestep_cooldown = (uint32_t)TINY386_JIT_PRESTEP_COOLDOWN; } while (0)
+    if (jit->prestep_cooldown != 0) {
+        jit->prestep_cooldown--;
+        jit->prestep_cooldown_skips++;
+        jit->interp_exits++;
+        jit->try_cycles += jit_cycles_since(try_start);
+        return 0;
+    }
+#else
+#define JIT_SET_PRESTEP_COOLDOWN() do { } while (0)
+#endif
+
     uint32_t cs_base = cpui386_get_cs_base(cpu);
     uint32_t eip     = cpui386_get_next_ip(cpu);
     uint32_t laddr   = cs_base + eip;
@@ -3383,6 +3403,7 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         jit_maybe_dump_stats(jit);
         jit->lookup_cycles += jit_cycles_since(lookup_start);
         jit->interp_exits++;
+        JIT_SET_PRESTEP_COOLDOWN();
         jit->try_cycles += jit_cycles_since(try_start);
         return 0;
     }
@@ -3395,6 +3416,7 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         jit_maybe_dump_stats(jit);
         jit->lookup_cycles += jit_cycles_since(lookup_start);
         jit->interp_exits++;
+        JIT_SET_PRESTEP_COOLDOWN();
         jit->try_cycles += jit_cycles_since(try_start);
         return 0;
     }
@@ -3407,6 +3429,9 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
             jit_maybe_dump_stats(jit);
             jit->lookup_cycles += jit_cycles_since(lookup_start);
             jit->interp_exits++;
+#if TINY386_JIT_PRESTEP_COOLDOWN_HOTSKIP
+            JIT_SET_PRESTEP_COOLDOWN();
+#endif
             jit->try_cycles += jit_cycles_since(try_start);
             return 0;
         }
@@ -3423,6 +3448,7 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
                        (unsigned)eip, (unsigned)paddr);
             jit_maybe_dump_stats(jit);
             jit->interp_exits++;
+            JIT_SET_PRESTEP_COOLDOWN();
             jit->try_cycles += jit_cycles_since(try_start);
             return 0;
         }
@@ -3431,6 +3457,7 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     }
 
     jit->hits++;
+    jit->prestep_cooldown = 0;
     jit->block_entries++;
     jit->jit_guest_insns += (uint32_t)block->x86_insns +
                             (uint32_t)block->link_x86_insns;
@@ -3452,5 +3479,6 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
                (void *)fn, (unsigned)cpui386_get_next_ip(cpu));
     jit_maybe_dump_stats(jit);
     jit->try_cycles += jit_cycles_since(try_start);
+#undef JIT_SET_PRESTEP_COOLDOWN
     return (int)block->x86_insns + (int)block->link_x86_insns;
 }

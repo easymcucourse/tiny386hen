@@ -114,6 +114,14 @@ typedef struct FPU FPU;
 #define TINY386_JIT_HOT_THRESHOLD 2
 #endif
 
+#ifndef TINY386_JIT_PRESTEP_COOLDOWN
+#define TINY386_JIT_PRESTEP_COOLDOWN 0
+#endif
+
+#ifndef TINY386_JIT_PRESTEP_COOLDOWN_HOTSKIP
+#define TINY386_JIT_PRESTEP_COOLDOWN_HOTSKIP 0
+#endif
+
 #define JIT_UNSUPPORTED_HIST_SIZE 512u
 
 #define JIT_NOJIT_ENTRIES 512u
@@ -374,6 +382,8 @@ typedef struct {
     uint32_t block_entries;
     uint32_t block_exits;
     uint32_t interp_exits;
+    uint32_t prestep_cooldown;
+    uint32_t prestep_cooldown_skips;
     uint64_t try_cycles;
     uint64_t lookup_cycles;
     uint64_t translate_cycles;

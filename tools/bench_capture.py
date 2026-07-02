@@ -127,6 +127,7 @@ def emit_csv(rows, out):
         "try_entries", "block_entries", "block_exits", "interp_exits",
         "try_cycles", "lookup_cycles", "translate_cycles", "exec_cycles",
         "guest_ptr_cycles", "guest_scan_cycles", "guest_scan_bytes",
+        "prestep_cooldown", "prestep_cooldown_skips",
         "dosbench_event", "dosbench_tag", "dosbench_case",
         "dosbench_ticks_hex", "dosbench_ticks",
     ]

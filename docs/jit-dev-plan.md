@@ -1276,3 +1276,31 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - Build and board result: `build_dosbench_l3_iram_macro` built and flashed on COM19, then ran three 90s DOSBENCH captures without panic/WDT. The phase result was effectively unchanged: VGA3->VGA1 `19877`, `19880`, `19878 ms` versus the previous default level3 mean `19877.7 ms`. DOSBENCH ticks stayed in noise range: ALU `323`, BRANCH `289`, STACK `40-41`, MEM `2-3`, SMC `0-1`.
 
 - Counter result: this does reduce translation-side cost, but not enough to affect the workload. Mean `translate_cycles` dropped from about `114750` to `65031`, and `guest_scan_cycles` from about `43382` to `8208`; however `lookup_cycles` stayed around `21M` per capture and dominates the remaining JIT tax. Conclusion: keep the change as a low-risk translation-cost cleanup, but the next performance work still needs lower lookup/fallback pressure or more useful translated coverage.
+
+## 2026-07-02 Execution Plan (P7 next optimization sweep)
+
+- Experiment A - prestep/fallback tax: add `TINY386_JIT_PRESTEP_COOLDOWN` and test cooldown `1/4/16` against the default level3 baseline. Metrics: VGA3->VGA1, DOSBENCH ticks, `try_entries`, `prestep_cooldown_skips`, `lookup_cycles`, `block_entries`, and `jit_guest_insns`. Acceptance: lower lookup/try tax without reducing useful block execution enough to slow the phase.
+
+- Experiment B - safe stack path: do not re-enable the raw stack fast path. Instead stage a segmented stack model: first inline SS/sp-mask address calculation while keeping `cpu_store32`, then only allow direct stack stores when SS base, stack mask, RAM bounds, MMIO, and SMC checks are safe. Acceptance: VGA1/DOSBENCH must pass, unsupported `6A` pressure must fall, and helper or lookup cost must drop.
+
+- Experiment C - coverage bundle: expand only in bundles that match unsupported/hot evidence, starting with safe stack opcodes plus common adjacent glue such as `PUSH r32`, `POP r32`, `LEA`, `MOVZX/MOVSX`, and revalidated short control-flow forms. Acceptance: `block_entries` and `jit_guest_insns` must rise materially, not merely reduce the unsupported histogram.
+
+## 2026-07-02 Execution Record (P7 prestep cooldown sweep)
+
+- Implemented a default-off `TINY386_JIT_PRESTEP_COOLDOWN` gate and exported `prestep_cooldown` / `prestep_cooldown_skips` through stats and `bench_capture.py`. The first pass applied cooldown after NOJIT, translate failure, and hot-threshold skips; the follow-up split added `TINY386_JIT_PRESTEP_COOLDOWN_HOTSKIP`, default `0`, so hot-threshold warmup is not suppressed unless explicitly requested.
+
+- Fixed-phase COM19 result, DOSBENCH image profile, level3 JIT:
+
+| config | runs | VGA3->VGA1 mean ms | lookup_cycles mean | translate_cycles mean | block_entries mean | jit_guest_insns mean | prestep skips mean | DOSBENCH result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| cooldown 0 sanity | 1 | 19895.0 | 22182685.0 | 87829.0 | 172.0 | 287.0 | 0.0 | ALU 323, BRANCH 290, STACK 40, MEM 3, SMC 0 |
+| cooldown 1, hotskip on | 3 | 19895.7 | 1093151.7 | 47770.0 | 80.3 | 134.3 | 1238.7 | ALU 322-323, BRANCH 288-289, STACK 40, MEM 2-3, SMC 1 |
+| cooldown 4, hotskip on | 3 | 19865.3 | 520035.7 | 23446.0 | 20.3 | 32.3 | 1984.7 | ALU 322-323, BRANCH 289, STACK 40, MEM 3, SMC 0-1 |
+| cooldown 16, hotskip on | 3 | 19896.3 | 181481.0 | 14998.3 | 5.0 | 8.0 | 2336.3 | ALU 321-322, BRANCH 288-289, STACK 40, MEM 2-3, SMC 0-1 |
+| cooldown 4, hotskip off | 3 | 19877.7 | 437175.3 | 25152.3 | 85.0 | 132.0 | 1951.0 | ALU 323, BRANCH 288, STACK 40-41, MEM 2, SMC 1 |
+
+- Validation: all three `cool4_nohotskip` fixed-phase runs produced DOSBENCH case ticks without panic/WDT. A separate 110s sanity capture reached `BENCH_END AUTO` with VGA3->VGA1 `19879 ms` and the same DOSBENCH envelope.
+
+- Decision: keep cooldown default-off. It proves the DOS-stage net negative includes repeated lookup/fallback/prestep tax, because lookup cycles collapse from about 22M to below 0.5M when attempts are skipped. It is not yet a production optimization: all cooldown variants reduce useful translated execution too much (`block_entries` drops from about 172 to 85 or lower), so the next real fix should be adaptive and sticky-NOJIT-specific rather than a global prestep gate.
+
+- Next implementation direction: preserve hot warmup, add per-paddr or per-slot sticky NOJIT backoff with short expiry, and spend coverage work only on safe stack/address forms that can raise `block_entries` and `jit_guest_insns` while keeping DOSBENCH and VGA1 stable. High-risk inline memory and raw stack fast paths remain locked until their segment, bounds, MMIO, and SMC guards are explicit.
