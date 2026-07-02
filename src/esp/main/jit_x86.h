@@ -110,6 +110,10 @@ typedef struct FPU FPU;
 #define TINY386_JIT_ENABLE_SMC_BITMAP 1
 #endif
 
+#ifndef TINY386_JIT_ONLY_OPCODE
+#define TINY386_JIT_ONLY_OPCODE -1
+#endif
+
 #ifndef TINY386_JIT_HOT_THRESHOLD
 #define TINY386_JIT_HOT_THRESHOLD 2
 #endif

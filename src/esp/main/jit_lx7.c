@@ -1032,6 +1032,7 @@ typedef enum {
 
 typedef struct {
     ActionType type;
+    uint16_t   opcode_key;
     int        dst;       /* x86 GPR index 0-7 */
     int        src;       /* x86 GPR index 0-7 (or shift amount) */
     int32_t    imm;       /* immediate value */
@@ -1048,6 +1049,8 @@ typedef struct {
 
 static X86Action s_jit_scan_actions[JIT_SCAN_LIMIT];
 static uint8_t   s_jit_scan_action_bytes[JIT_SCAN_LIMIT];
+
+#define JIT_OPCODE_KEY_NONE 0xffffu
 
 static const char *jit_action_name(ActionType type)
 {
@@ -1231,6 +1234,7 @@ static IRAM_ATTR int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action
     memset(a, 0, sizeof(*a));
     a->mem_base = -1;
     a->mem_index = -1;
+    a->opcode_key = JIT_OPCODE_KEY_NONE;
 
     uint8_t op = src[len++];
     bool opsz16 = false;
@@ -1247,6 +1251,7 @@ static IRAM_ATTR int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action
 
     if (opsz16 && op != 0x89 && op != 0x8B)
         return 0;
+    a->opcode_key = op;
 
     if (op == 0x90) {
         a->type = ACT_NOP;
@@ -1536,6 +1541,7 @@ static IRAM_ATTR int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action
     /* ── Jcc rel32  (0F 80-8F) ───────────────────────────────── */
     if (op == 0x0F) {
         uint8_t op2 = src[len++];
+        a->opcode_key = (uint16_t)(0x100u | op2);
         if (op2 >= 0xC8 && op2 <= 0xCF) {
             a->type = ACT_BSWAP_R;
             a->dst  = op2 & 7;
@@ -2369,8 +2375,6 @@ static IRAM_ATTR bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
 static uint32_t s_jit_selftest_allow;
 
-#define JIT_OPCODE_KEY_NONE 0xffffu
-
 static inline uint32_t jit_hash(uint32_t paddr)
 {
     /* Simple hash: Knuth multiplicative hash */
@@ -2956,6 +2960,10 @@ static IRAM_ATTR bool jit_action_enabled(const X86Action *a, int block_insn_inde
 
     if (TINY386_JIT_LEVEL <= 0)
         return false;
+#if TINY386_JIT_ONLY_OPCODE >= 0
+    if (a->opcode_key != (uint16_t)TINY386_JIT_ONLY_OPCODE)
+        return false;
+#endif
     if (TINY386_JIT_LEVEL >= 1 && a->type == ACT_NOP)
         return true;
     if (TINY386_JIT_LEVEL >= 1 && TINY386_JIT_ENABLE_MOV_RI &&

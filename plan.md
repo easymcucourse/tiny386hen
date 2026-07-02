@@ -201,3 +201,44 @@
   - For now, do not enable or add opcode support just because `nojit_hot` points
     at `6A`/`4A`. A useful opcode change must improve at least one asm case
     without regressing the rest beyond normal 1-tick noise.
+
+### Single-Opcode DOSBENCH Comparison
+
+- Added a test-only compile-time gate:
+  - `TINY386_JIT_ONLY_OPCODE=-1`: normal behavior.
+  - `TINY386_JIT_ONLY_OPCODE=0xNN`: only that decoded opcode key may be JIT
+    enabled; all other decoded actions are treated as disabled.
+  - Extended `X86Action` with `opcode_key` so this is per opcode, not per broad
+    action class.
+- Built and tested three configs, each with three 90s DOSBENCH captures:
+  - NOJIT baseline:
+    - build: `build_opcode_nojit`
+    - flags: `TINY386_JIT_LEVEL=0`
+    - logs: `serial_COM19_opcode_nojit_run1..3_20260702.*`
+  - single opcode `6A`:
+    - build: `build_opcode_6a`
+    - flags: `TINY386_JIT_LEVEL=3`, `TINY386_JIT_ONLY_OPCODE=0x6A`,
+      `TINY386_JIT_ENABLE_PUSH_IMM8=1`, `TINY386_JIT_ENABLE_MEM_HELPERS=1`
+    - logs: `serial_COM19_opcode_6a_run1..3_20260702.*`
+  - single opcode `4A`:
+    - build: `build_opcode_4a`
+    - flags: `TINY386_JIT_LEVEL=3`, `TINY386_JIT_ONLY_OPCODE=0x4A`
+    - logs: `serial_COM19_opcode_4a_run1..3_20260702.*`
+- All nine captures reached `BENCH_END AUTO`; no panic/WDT was observed.
+
+| config | ALU | BRANCH | STACK | MEM | SMC | translated | block_entries | helper_actions |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NOJIT | 327.7 | 292.7 | 41.3 | 3.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| only `6A` | 328.0 | 293.0 | 42.0 | 3.0 | 0.0 | 426.7 | 426.7 | 426.7 |
+| only `4A` | 327.7 | 293.0 | 41.7 | 3.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+
+- Single-opcode conclusion:
+  - `6A` (`PUSH imm8`) does get translated and executed, but every translated
+    block still uses the helper path. DOSBENCH does not improve versus NOJIT;
+    `STACK` is worse by about `0.7` tick and other cases are within/noisily
+    worse than NOJIT.
+  - `4A` (`DEC EDX`) produces no translated blocks in this workload under the
+    existing flags-dead safety rule, so it is effectively equivalent to NOJIT.
+  - Therefore neither hot opcode should be enabled as-is. The next useful test
+    is not "more opcodes" broadly; it is a safe, non-helper implementation that
+    shows a positive DOSBENCH case delta when enabled alone.
