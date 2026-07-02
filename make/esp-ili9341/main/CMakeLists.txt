@@ -74,7 +74,7 @@ set(TINY386_JIT_STATS_PERIOD "2048" CACHE STRING "Dump JIT stats every N attempt
 set(TINY386_JIT_UNSUPPORTED_HIST "1" CACHE STRING "Track top unsupported JIT opcodes in stats dumps")
 set(TINY386_BENCH_PROFILE "0" CACHE STRING "Benchmark profile: 0=normal boot, 1=selftest, 2=DOS microbench")
 set(TINY386_JIT_ENABLE_LINKING "1" CACHE STRING "Enable JIT block linking exit stubs")
-set(TINY386_JIT_ENABLE_MEM_HELPERS "1" CACHE STRING "Enable helper-call memory operand JIT actions")
+set(TINY386_JIT_ENABLE_MEM_HELPERS "0" CACHE STRING "Enable helper-call memory operand JIT actions")
 set(TINY386_JIT_ENABLE_PUSH_IMM8 "0" CACHE STRING "Enable helper-call PUSH imm8 JIT action")
 set(TINY386_JIT_ENABLE_CMPTEST_JCC "1" CACHE STRING "Enable CMP/TEST plus Jcc fusion actions")
 set(TINY386_JIT_ENABLE_SMC_BITMAP "1" CACHE STRING "Enable translated-code page bitmap before SMC scans")
