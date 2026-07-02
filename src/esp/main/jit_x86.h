@@ -74,12 +74,24 @@ typedef struct FPU FPU;
 #define TINY386_BENCH_PROFILE 0
 #endif
 
+#ifndef TINY386_JIT_SELFTEST_ONLY
+#define TINY386_JIT_SELFTEST_ONLY 0
+#endif
+
+#ifndef TINY386_JIT_SELFTEST_AT_BOOT
+#define TINY386_JIT_SELFTEST_AT_BOOT 0
+#endif
+
 #ifndef TINY386_JIT_ENABLE_LINKING
 #define TINY386_JIT_ENABLE_LINKING 1
 #endif
 
 #ifndef TINY386_JIT_ENABLE_MEM_HELPERS
 #define TINY386_JIT_ENABLE_MEM_HELPERS 1
+#endif
+
+#ifndef TINY386_JIT_ENABLE_PUSH_IMM8
+#define TINY386_JIT_ENABLE_PUSH_IMM8 0
 #endif
 
 #ifndef TINY386_JIT_ENABLE_CMPTEST_JCC
@@ -90,7 +102,14 @@ typedef struct FPU FPU;
 #define TINY386_JIT_ENABLE_SMC_BITMAP 1
 #endif
 
+#ifndef TINY386_JIT_HOT_THRESHOLD
+#define TINY386_JIT_HOT_THRESHOLD 2
+#endif
+
 #define JIT_UNSUPPORTED_HIST_SIZE 512u
+
+#define JIT_NOJIT_ENTRIES 512u
+#define JIT_HOT_ENTRIES   512u
 
 /* Guest page granularity used for future self-modifying-code tracking. */
 #define JIT_GUEST_PAGE_SIZE 4096u
@@ -267,6 +286,20 @@ typedef struct {
     uint16_t active_blocks;  /* Number of valid blocks that start/touch this page. */
 } JITPageTrack;
 
+typedef struct {
+    uint32_t guest_paddr;
+    uint8_t  valid;
+    uint8_t  reserved;
+    uint16_t bail;
+} JITNojitEntry;
+
+typedef struct {
+    uint32_t guest_paddr;
+    uint8_t  valid;
+    uint8_t  hits;
+    uint16_t reserved;
+} JITHotEntry;
+
 /* ------------------------------------------------------------------ */
 /* One cached basic block                                              */
 /* ------------------------------------------------------------------ */
@@ -304,6 +337,8 @@ typedef struct {
     uint32_t translated;
     uint32_t cache_misses;
     uint32_t sticky_nojit_hits;
+    uint32_t nojit_table_sets;
+    uint32_t hot_threshold_skips;
     uint32_t jit_guest_insns;
     uint32_t emitted_x86_bytes;
     uint32_t emitted_host_bytes;
@@ -313,7 +348,13 @@ typedef struct {
     uint32_t pool_flushes;
     uint32_t invalidations; /* Cache entries dropped by SMC/reset. */
     uint32_t smc_flushes;   /* Page/range invalidations requested. */
+    uint32_t smc_bitmap_misses;
+    uint32_t smc_scans;
+    uint32_t smc_false_positives;
+    uint32_t smc_overlap_invalidations;
     uint32_t smc_page_bitmap[JIT_SMC_PAGE_WORDS]; /* Hashed pages with translated code. */
+    JITNojitEntry nojit_table[JIT_NOJIT_ENTRIES];
+    JITHotEntry hot_table[JIT_HOT_ENTRIES];
     uint32_t bail_counts[JIT_BAIL_POOL_FULL + 1u];
     uint32_t unsupported_opcode_counts[JIT_UNSUPPORTED_HIST_SIZE];
     uint32_t unsupported_opcode_total;

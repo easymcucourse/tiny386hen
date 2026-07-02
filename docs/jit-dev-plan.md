@@ -1156,3 +1156,89 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 | 6.4 Gate matrix / bisection | Done | Separate build succeeded with `-DTINY386_BENCH_PROFILE=2 -DTINY386_JIT_ENABLE_LINKING=0`; COM19 app-flash and capture were successful. | Added gates for linking, memory helpers, CMP/TEST+Jcc, SMC bitmap, benchmark profile, and unsupported histogram. Each future comparison should change one gate at a time. |
 | 6.5 Hot/cold block strategy | Measurement hooks done, policy deferred | Capture exposes miss/translate/bail/sticky-NOJIT pressure; no hotness threshold was enabled. | Current evidence points first to stack opcode coverage (`PUSH imm8`) rather than a hot/cold translation policy change. |
 | 6.6 Tuning decision table | Done | Added `docs/jit-benchmark-results.md` and recorded the COM19 result row. | Decision table keeps unsupported `6A PUSH imm8` as the next evidence-backed opcode target; inline memory fast path remains gated off until helper cost dominates a repeated benchmark. |
+
+## P7 Stabilization And Evidence-First Optimization Plan (2026-07-02)
+
+### P0 - Decide Whether JIT Is Negative During DOS
+
+#### Task 7.0 - Fixed-phase level0 vs level3 A/B
+
+- **Goal**: Answer whether JIT is a net loss in the DOS phase before adding more opcode coverage.
+- **Scope**: Use event slices instead of wall-clock points: `set VGA mode` -> `Booting from 0000:7c00` -> DOS prompt or the closest stable DOS marker currently available. Run level0 and level3 three times each, then compare the DOS-phase mean wall time.
+- **Dependencies**: Keep the board port stable with automatic active COM detection, and keep the `debugcon` stack fix in the default configuration.
+- **Acceptance**: A small table with 3x level0 and 3x level3 captures, per-phase wall time, final mean, and the decision: opcode coverage first vs churn reduction first.
+- **Risk**: Time-window captures can mislead; phase markers are the source of truth.
+
+### P1 - Stop Wasting Translation Work
+
+#### Task 7.1 - Persistent NOJIT and hotness threshold
+
+- **Goal**: Eliminate repeated scans for blocks that are already known to fail translation.
+- **Scope**: Investigate why the P6 sample had `1588` bails but only `271` sticky NOJIT hits. Make unsupported-opcode entry paddr values immediately and persistently NOJIT even when the direct-mapped block cache slot is later reused. Add a configurable hotness threshold so cold/one-shot paddr values are interpreted until their Nth hit.
+- **Implementation note**: The first slice adds a separate NOJIT table and `TINY386_JIT_HOT_THRESHOLD` cache variable, defaulting to `2`. Selftest-only and selftest-at-boot builds bypass the threshold so differential tests still exercise JIT on their first step.
+- **Acceptance**: Same workload shows clearly lower `translate_attempts` and `bailed`, `sticky_nojit` rises relative to unsupported repeats, IPS does not regress, and selftest passes.
+- **Risk**: A stale NOJIT entry can suppress future translation after SMC/code replacement. Correctness is preserved because execution falls back to the interpreter, but performance evidence must be interpreted with this in mind.
+
+#### Task 7.2 - SMC flush attribution
+
+- **Goal**: Separate SMC bitmap false positives from true translated-code overlap.
+- **Scope**: Count bitmap misses, bitmap-hit scans, scans with no overlap, and scans that actually invalidate translated blocks.
+- **Acceptance**: Benchmark snapshots explain whether the P6 `smc_flushes=430` sample was mostly harmless page/hash noise or real self-modifying-code churn.
+- **Risk**: More counters are not a policy by themselves. If true overlap dominates, the next task should mark high-frequency self-modifying pages NOJIT instead of repeatedly translating them.
+
+### P2 - Evidence-backed Stack Opcode Coverage
+
+#### Task 7.3 - `PUSH imm8` first
+
+- **Goal**: Cover the strongest unsupported-opcode signal: `6A PUSH imm8`, which represented about 98% of unsupported hits in the P6 sample.
+- **Scope**: Start with a conservative helper-call path: sign-extend imm8, decrement ESP by 4, store through the existing CPU memory helper path, and update ESP explicitly.
+- **Acceptance**: Differential selftests cover ESP update, sign extension, SS/stack edge behavior, and stack writes that cross pages; A/B captures must show benefit before enabling by default.
+- **Risk**: Stack writes can interact with SMC invalidation when stack and code pages alias or are reused by DOS code.
+
+#### Task 7.4 - `PUSH r32` / `POP r32`
+
+- **Goal**: Extend stack coverage only after `PUSH imm8` is proven useful.
+- **Scope**: Use the same conservative helper-call model as Task 7.3.
+- **Acceptance**: Differential selftests for all GPRs, especially ESP, and a repeated DOS stack microbench result.
+
+#### Task 7.5 - `CALL rel` / `RET`
+
+- **Goal**: Cover control-flow stack operations after simple stack data movement is stable.
+- **Scope**: Treat as a control-flow/block-exit task, not just a stack store/load task. Keep block linking interactions explicit and conservative.
+- **Acceptance**: Differential selftests for next_ip, return target, ESP, and nested call/ret smoke cases.
+- **Risk**: This touches block boundaries and C/JIT dispatch semantics, so it should not be bundled with PUSH/POP.
+
+### P3 - Structural Optimizations After Evidence
+
+#### Task 7.6 - Expanded block linking
+
+- **Goal**: Add taken-Jcc linking and miss patch-back only if A/B data shows C dispatch overhead is a bottleneck.
+- **Acceptance**: Gate-controlled comparison proves benefit without destabilizing invalidation.
+
+#### Task 7.7 - Inline memory fast path remains deferred
+
+- **Goal**: Keep Task 5.9 deferred until helper-call cost dominates repeated captures.
+- **Rationale**: The P6 sample had only `helper_actions=14`; bypassing paging/MMIO/SMC semantics is not justified by current evidence.
+
+## 2026-07-02 Execution Record (P7 first slice)
+
+- P7 plan added: P0 fixed-phase A/B, P1 translation-churn stop-loss, P2 stack opcode coverage, and P3 deferred structural optimizations are now recorded as Tasks 7.0 through 7.7.
+- Task 7.1 first slice done: added an independent NOJIT table so unsupported paddr entries survive direct-mapped block-cache slot reuse; added `TINY386_JIT_HOT_THRESHOLD`, default `2`, to skip translating one-shot cold blocks. Selftest-only and selftest-at-boot builds bypass the threshold so differential tests still JIT on their first step.
+- Task 7.2 first slice done: SMC invalidation now counts bitmap misses, bitmap-hit scans, scans with no actual overlap, and scans that really invalidated translated code.
+- Tooling updated: `tools/bench_capture.py` now keeps P7 counters in stable CSV columns, parses `[123 ms] [perf] ...` lines, and auto-detects UTF-16 logs produced by PowerShell `Tee-Object`.
+- Correctness fix found during P7 board selftest: `ACT_MOV_RM8` and `ACT_MOV_RM16` now include the destination GPR in the read mask before partial-register merge. Without this, `MOV AH,[mem]` could clear AL when the old EAX value was not loaded.
+- Verification: default ILI9341 firmware builds successfully. Selftest-only firmware builds, app-flashes on COM19, and reports `119/119 PASS`.
+- Normal smoke: default firmware was app-flashed back to COM19. A 45s capture reached SeaBIOS, `Booting from 0000:7c00`, and `set VGA mode 1` with no WDT/panic. Artifacts: `serial_COM19_p7_selftest_20260702.log`, `serial_COM19_p7_smoke_20260702.log`, and `serial_COM19_p7_smoke_20260702.csv`.
+- Task 7.0 done: built and flashed dedicated benchmark-profile firmware for level3 and level0, then captured three 45s COM19 runs for each. Level3 marker timings were VGA3 -> boot sector `7279`, `7280`, `7280` ms and did not reach `set VGA mode 1` in the 45s window. Level0 marker timings were VGA3 -> boot sector `7278`, `7278`, `7278` ms and VGA3 -> VGA1 `19905`, `19906`, `19906` ms.
+- P7.0 decision: boot-sector timing is effectively tied, but the DOS post-boot phase is still negative for current level3 because level0 reaches `set VGA mode 1` reliably while level3 does not. P7.1 did solve the translation-churn symptom: final level3 benchmark snapshots had only `26` translate attempts, `16` translations, and `10` bails, versus the P6 sample's `1613` attempts and `1588` bails. The next useful work remains P2 stack opcode coverage, starting with `6A PUSH imm8`, rather than structural linking or inline memory fast paths.
+- SMC attribution from the A/B run: level3 final snapshots had `302` SMC scans and all were false positives, with `0` true overlap invalidations; level0 had no JIT SMC scans. This argues for keeping the bitmap prefilter and avoiding an SMC policy change until a workload shows real overlap churn.
+- P7.0 artifacts: `serial_COM19_p7_l3_run1_20260702.log/.csv/.phase.csv` through `run3`, and `serial_COM19_p7_l0_run1_20260702.log/.csv/.phase.csv` through `run3`.
+
+## 2026-07-02 Execution Record (P7.3 PUSH imm8)
+
+- Task 7.3 implementation done: added `ACT_PUSH_IMM8` for opcode `6A`, sign-extending imm8 and writing a 32-bit value through an SS stack helper. The helper decrements ESP by 4, stores with `cpu_store32(..., SEG_SS, ...)`, then commits ESP only if the store succeeds.
+- Added `TINY386_JIT_ENABLE_PUSH_IMM8`, default `0`, and a CMake cache variable of the same name. Selftest whitelisting can still exercise the action regardless of the default runtime gate.
+- Differential selftest: selftest-only firmware built, app-flashed on COM19, and reported `122/122 PASS`. New cases cover positive imm8, negative imm8 sign extension, and an unaligned ESP stack write. Artifact: `serial_COM19_p7_push_selftest_20260702.log`.
+- Benchmark gate result: with `TINY386_BENCH_PROFILE=2`, level3, and `TINY386_JIT_ENABLE_PUSH_IMM8=1`, a 45s run still reached boot sector at VGA3 -> boot `7280 ms` but did not reach `set VGA mode 1`. The final snapshot had `translate_attempts=1258`, `translated=1250`, `bailed=8`, `helper_actions=1240`, and `unsupported_total=6`; `6A` disappeared from the unsupported list.
+- P7.3 decision: keep `PUSH imm8` disabled by default. The opcode implementation is correct in isolation, but enabling it alone converts the old unsupported `6A` hotspot into helper-call stack translation churn without improving the fixed-phase result. The next stack work should not simply turn on more helper-call stack opcodes by default; it needs either a broader stack-op bundle behind a gate, a stack-specific hotness/NOJIT policy, or lower-cost stack memory handling.
+- P7.3 artifacts: `serial_COM19_p7_push_l3_run1_20260702.log`, `.csv`, and `.phase.csv`.

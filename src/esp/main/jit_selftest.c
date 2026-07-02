@@ -53,6 +53,7 @@
 #define ACT_CMP_RM32   27
 #define ACT_CMP_MR32   28
 #define ACT_TEST_MR32  29
+#define ACT_PUSH_IMM8  30
 
 #define JIT_ST_ALLOW(act)  (1u << (unsigned)(act))
 
@@ -192,6 +193,9 @@ static const uint8_t code_mov_ax_mem_ebx_disp8[] = { 0x66, 0x8B, 0x43, 0x20 };
 static const uint8_t code_mov_mem_ebx_disp8_ax[] = { 0x66, 0x89, 0x43, 0x24 };
 static const uint8_t code_mov_eax_mem_sib_scale4[] = { 0x8B, 0x44, 0x8B, 0x20 };
 static const uint8_t code_mov_mem_sib_scale4_eax[] = { 0x89, 0x44, 0x8B, 0x24 };
+static const uint8_t code_push_imm8_pos[] = { 0x6A, 0x7F };
+static const uint8_t code_push_imm8_neg[] = { 0x6A, 0x80 };
+static const uint8_t code_push_imm8_unaligned[] = { 0x6A, 0xFE };
 static const uint8_t code_jmp_rel8[] = {
 	0xEB, 0x03,                   /* jmp +3 */
 	0xB8, 0x11, 0x11, 0x11, 0x11, /* skipped */
@@ -516,6 +520,20 @@ static void init_mem_sib_state(CPUI386 *cpu)
 	init_mem_state(cpu);
 	cpui386_set_gpr(cpu, 1, 0x00000004u);
 	cpui386_set_gpr(cpu, 3, 0x00001800u);
+}
+
+static void init_stack_state(CPUI386 *cpu)
+{
+	for (int i = 0; i < 8; i++)
+		cpui386_set_gpr(cpu, i, 0x34353637u + (uint32_t)i);
+	cpui386_set_gpr(cpu, 4, 0x00001800u);
+	cpu_setflags(cpu, FL_CF | FL_PF | FL_AF | FL_ZF | FL_SF | FL_OF, 0);
+}
+
+static void init_stack_unaligned_state(CPUI386 *cpu)
+{
+	init_stack_state(cpu);
+	cpui386_set_gpr(cpu, 4, 0x00001803u);
 }
 
 static const char *gpr_name(int i)
@@ -865,6 +883,60 @@ static bool run_memory_mov_case(CPUI386 *cpu, uint8_t *mem,
 	}
 
 	esp_rom_printf("[jit_selftest] PASS %s_mem (interp=%d jit=%d)\n",
+		       tc->name, interp_steps, jit_steps);
+	return true;
+}
+
+static bool run_stack_case(CPUI386 *cpu, uint8_t *mem, const SelftestCase *tc)
+{
+	JITCpuSnapshot baseline;
+	JITCpuSnapshot interp_result;
+	JITCpuSnapshot jit_result;
+	uint32_t interp_mem = 0;
+	uint32_t jit_mem = 0;
+	uint32_t interp_esp;
+	uint32_t jit_esp;
+	int interp_steps;
+	int jit_steps;
+
+	setup_cpu(cpu, mem, tc);
+	memset(mem + 0x17f0, 0xa5, 0x30);
+	jit_cpu_snapshot(cpu, &baseline);
+
+	jit_cpu_restore(cpu, &baseline);
+	interp_steps = jit_cpu_step_interp(cpu, 1);
+	jit_cpu_snapshot(cpu, &interp_result);
+	interp_esp = interp_result.gpr[4];
+	if (interp_esp + sizeof(interp_mem) <= ST_PHYS_SIZE)
+		memcpy(&interp_mem, mem + interp_esp, sizeof(interp_mem));
+
+	setup_cpu(cpu, mem, tc);
+	memset(mem + 0x17f0, 0xa5, 0x30);
+	jit_cpu_restore(cpu, &baseline);
+	jit_cpu_invalidate_cache(cpu);
+	jit_selftest_set_allowed_actions(tc->jit_allow);
+	jit_steps = jit_cpu_step_jit(cpu, 1);
+	jit_selftest_clear_allowed_actions();
+	jit_cpu_snapshot(cpu, &jit_result);
+	jit_esp = jit_result.gpr[4];
+	if (jit_esp + sizeof(jit_mem) <= ST_PHYS_SIZE)
+		memcpy(&jit_mem, mem + jit_esp, sizeof(jit_mem));
+
+	if (interp_steps != 1 || jit_steps != 1) {
+		esp_rom_printf("[jit_selftest] FAIL %s_stack: steps interp=%d jit=%d\n",
+			       tc->name, interp_steps, jit_steps);
+		return false;
+	}
+	if (!compare_snapshots(tc->name, &interp_result, &jit_result))
+		return false;
+	if (interp_mem != jit_mem) {
+		esp_rom_printf("[jit_selftest] FAIL %s_stack: mem[ESP] 0x%08" PRIx32
+			       " != 0x%08" PRIx32 "\n",
+			       tc->name, interp_mem, jit_mem);
+		return false;
+	}
+
+	esp_rom_printf("[jit_selftest] PASS %s_stack (interp=%d jit=%d)\n",
 		       tc->name, interp_steps, jit_steps);
 	return true;
 }
@@ -1427,6 +1499,27 @@ int jit_selftest_run(void)
 			.jit_allow = JIT_ST_ALLOW(ACT_MOV_MR32),
 			.init = init_mem_sib_state,
 		},
+		{
+			.name = "PUSH_imm8_pos",
+			.code = code_push_imm8_pos,
+			.code_len = sizeof(code_push_imm8_pos),
+			.jit_allow = JIT_ST_ALLOW(ACT_PUSH_IMM8),
+			.init = init_stack_state,
+		},
+		{
+			.name = "PUSH_imm8_neg",
+			.code = code_push_imm8_neg,
+			.code_len = sizeof(code_push_imm8_neg),
+			.jit_allow = JIT_ST_ALLOW(ACT_PUSH_IMM8),
+			.init = init_stack_state,
+		},
+		{
+			.name = "PUSH_imm8_unaligned",
+			.code = code_push_imm8_unaligned,
+			.code_len = sizeof(code_push_imm8_unaligned),
+			.jit_allow = JIT_ST_ALLOW(ACT_PUSH_IMM8),
+			.init = init_stack_unaligned_state,
+		},
 	};
 	static const SelftestCase mixed_nop_mov = {
 		.name = "MIXED_NOP_THEN_MOV_EAX",
@@ -1612,6 +1705,9 @@ int jit_selftest_run(void)
 			else if (strstr(cases[i].name, "MOV_mem_") != NULL)
 				probe = 0x1824;
 			if (!run_memory_mov_case(cpu, mem, &cases[i], probe))
+				failures++;
+		} else if (cases[i].jit_allow == JIT_ST_ALLOW(ACT_PUSH_IMM8)) {
+			if (!run_stack_case(cpu, mem, &cases[i]))
 				failures++;
 		} else if (!run_case(cpu, mem, &cases[i])) {
 			failures++;
