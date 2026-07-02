@@ -75,6 +75,18 @@
 #define JIT_TRACEF(...) do { } while (0)
 #endif
 
+static inline uint32_t jit_ccount(void)
+{
+    uint32_t ccount;
+    __asm__ __volatile__("rsr.ccount %0" : "=a"(ccount));
+    return ccount;
+}
+
+static inline uint32_t jit_cycles_since(uint32_t start)
+{
+    return jit_ccount() - start;
+}
+
 static uint8_t *s_jit_pool_write;
 static uint8_t *s_jit_pool_exec;
 static bool     s_jit_pool_psram;
@@ -1445,6 +1457,15 @@ static void emit_mem_address(EmitPtr *p, const X86Action *a, int dst, int tmp)
     }
 }
 
+static void emit_guest_ptr32(EmitPtr *p, const X86Action *a,
+                             int cpu_reg, int addr_reg,
+                             int tmp_reg, int ptr_reg)
+{
+    emit_mem_address(p, a, addr_reg, tmp_reg);
+    emit_l32i(p, ptr_reg, cpu_reg, JIT_PHYS_MEM_OFF / 4);
+    emit_add(p, ptr_reg, ptr_reg, addr_reg);
+}
+
 static void emit_merge_u8(EmitPtr *p, int dst_reg, int value_reg, int tmp_reg, bool high)
 {
     uint32_t clear_mask = high ? 0xffff00ffu : 0xffffff00u;
@@ -1530,6 +1551,12 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     }
 
     case ACT_MOV_RM32:
+        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+            GUARD(48);
+            emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
+            emit_l32i(p, dr, t2, 0);
+            break;
+        }
         GUARD(112);
         emit_store_gprs(p, cpu_reg, store_mask);
         emit_mem_address(p, a, t0, t1);
@@ -1541,6 +1568,12 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
         break;
 
     case ACT_MOV_MR32:
+        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+            GUARD(48);
+            emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
+            emit_s32i(p, sr, t2, 0);
+            break;
+        }
         GUARD(112);
         emit_store_gprs(p, cpu_reg, store_mask);
         emit_mem_address(p, a, t0, t1);
@@ -1619,6 +1652,15 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     }
 
     case ACT_PUSH_IMM8:
+        if (TINY386_JIT_ENABLE_STACK_FASTPATH) {
+            GUARD(64);
+            emit_addi(p, X86REG_TO_LX7(4), X86REG_TO_LX7(4), -4);
+            emit_l32i(p, t2, cpu_reg, JIT_PHYS_MEM_OFF / 4);
+            emit_add(p, t2, t2, X86REG_TO_LX7(4));
+            emit_movi32(p, t1, (uint32_t)a->imm);
+            emit_s32i(p, t1, t2, 0);
+            break;
+        }
         GUARD(112);
         emit_store_gprs(p, cpu_reg, store_mask);
         emit_movi32(p, 11, (uint32_t)a->imm);
@@ -1849,6 +1891,25 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
     /* ---- CMP / TEST ---------------------------------------- */
     case ACT_CMP_RM32: {
         bool fd = a->flags_dead;
+        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+            GUARD(112);
+            emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
+            emit_l32i(p, t2, t2, 0);
+            emit_sub(p, t0, dr, t2);
+            cs->cmp_mode = 1;
+            cs->cmp_lreg = dr;
+            cs->cmp_rreg = t2;
+            if (!fd) {
+                emit_s32i(p, dr, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
+                emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
+                emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+                emit_movi(p, t1, JIT_CC_SUB);
+                emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+                emit_movi32(p, t1, JIT_CC_MASK_ARITH);
+                emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+            }
+            break;
+        }
         GUARD(176);
         emit_store_gprs(p, cpu_reg, store_mask);
         emit_mem_address(p, a, t0, t1);
@@ -1875,6 +1936,25 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
     case ACT_CMP_MR32: {
         bool fd = a->flags_dead;
+        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+            GUARD(112);
+            emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
+            emit_l32i(p, t2, t2, 0);
+            emit_sub(p, t0, t2, sr);
+            cs->cmp_mode = 1;
+            cs->cmp_lreg = t2;
+            cs->cmp_rreg = sr;
+            if (!fd) {
+                emit_s32i(p, t2, LX7_CPU_REG, JIT_CC_SRC1_OFF / 4);
+                emit_s32i(p, sr, LX7_CPU_REG, JIT_CC_SRC2_OFF / 4);
+                emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+                emit_movi(p, t1, JIT_CC_SUB);
+                emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+                emit_movi32(p, t1, JIT_CC_MASK_ARITH);
+                emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+            }
+            break;
+        }
         GUARD(176);
         emit_store_gprs(p, cpu_reg, store_mask);
         emit_mem_address(p, a, t0, t1);
@@ -1901,6 +1981,22 @@ static bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
     case ACT_TEST_MR32: {
         bool fd = a->flags_dead;
+        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+            GUARD(96);
+            emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
+            emit_l32i(p, t2, t2, 0);
+            emit_and(p, t0, t2, sr);
+            cs->cmp_mode = 3;
+            cs->cmp_lreg = t0;
+            if (!fd) {
+                emit_s32i(p, t0, LX7_CPU_REG, JIT_CC_DST_OFF / 4);
+                emit_movi(p, t1, JIT_CC_AND);
+                emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_OP_OFF / 4);
+                emit_movi32(p, t1, JIT_CC_MASK_LOGIC);
+                emit_s32i(p, t1, LX7_CPU_REG, JIT_CC_MASK_OFF / 4);
+            }
+            break;
+        }
         GUARD(160);
         emit_store_gprs(p, cpu_reg, store_mask);
         emit_mem_address(p, a, t0, t1);
@@ -2348,6 +2444,22 @@ static void jit_dump_stats(const JITState *jit)
                    (unsigned)jit->smc_scans,
                    (unsigned)jit->smc_false_positives,
                    (unsigned)jit->smc_overlap_invalidations);
+    esp_rom_printf("[jit_stats] try_entries=%u block_entries=%u "
+                   "block_exits=%u interp_exits=%u try_cycles=%llu "
+                   "lookup_cycles=%llu translate_cycles=%llu "
+                   "exec_cycles=%llu guest_ptr_cycles=%llu "
+                   "guest_scan_cycles=%llu guest_scan_bytes=%u\n",
+                   (unsigned)jit->try_entries,
+                   (unsigned)jit->block_entries,
+                   (unsigned)jit->block_exits,
+                   (unsigned)jit->interp_exits,
+                   (unsigned long long)jit->try_cycles,
+                   (unsigned long long)jit->lookup_cycles,
+                   (unsigned long long)jit->translate_cycles,
+                   (unsigned long long)jit->exec_cycles,
+                   (unsigned long long)jit->guest_ptr_cycles,
+                   (unsigned long long)jit->guest_scan_cycles,
+                   (unsigned)jit->guest_scan_bytes);
     for (unsigned i = 1; i <= JIT_BAIL_POOL_FULL; i++) {
         if (jit->bail_counts[i] != 0) {
             esp_rom_printf("[jit_stats] bail %-20s %u\n",
@@ -2393,7 +2505,12 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
                    "smc_bitmap_misses=%u smc_scans=%u "
                    "smc_false_positives=%u smc_overlap_invalidations=%u "
                    "linked_exits=%u helper_actions=%u emitted_x86_bytes=%u "
-                   "emitted_host_bytes=%u unsupported_total=%u\n",
+                   "emitted_host_bytes=%u unsupported_total=%u "
+                   "try_entries=%u block_entries=%u block_exits=%u "
+                   "interp_exits=%u try_cycles=%llu lookup_cycles=%llu "
+                   "translate_cycles=%llu exec_cycles=%llu "
+                   "guest_ptr_cycles=%llu guest_scan_cycles=%llu "
+                   "guest_scan_bytes=%u\n",
                    phase ? phase : "boot",
                    (unsigned)ms, ips, cycles,
                    (unsigned)pc_steps, (unsigned)step_count,
@@ -2422,7 +2539,18 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
                    (unsigned)jit->helper_call_actions,
                    (unsigned)jit->emitted_x86_bytes,
                    (unsigned)jit->emitted_host_bytes,
-                   (unsigned)jit->unsupported_opcode_total);
+                   (unsigned)jit->unsupported_opcode_total,
+                   (unsigned)jit->try_entries,
+                   (unsigned)jit->block_entries,
+                   (unsigned)jit->block_exits,
+                   (unsigned)jit->interp_exits,
+                   (unsigned long long)jit->try_cycles,
+                   (unsigned long long)jit->lookup_cycles,
+                   (unsigned long long)jit->translate_cycles,
+                   (unsigned long long)jit->exec_cycles,
+                   (unsigned long long)jit->guest_ptr_cycles,
+                   (unsigned long long)jit->guest_scan_cycles,
+                   (unsigned)jit->guest_scan_bytes);
     jit_dump_unsupported_opcodes(jit);
 }
 
@@ -2431,15 +2559,17 @@ static bool jit_action_uses_helper(const X86Action *a)
     switch (a->type) {
     case ACT_MOV_RM32:
     case ACT_MOV_MR32:
+    case ACT_CMP_RM32:
+    case ACT_CMP_MR32:
+    case ACT_TEST_MR32:
+        return !TINY386_JIT_ENABLE_INLINE_MEM;
     case ACT_MOV_RM8:
     case ACT_MOV_MR8:
     case ACT_MOV_RM16:
     case ACT_MOV_MR16:
-    case ACT_CMP_RM32:
-    case ACT_CMP_MR32:
-    case ACT_TEST_MR32:
-    case ACT_PUSH_IMM8:
         return true;
+    case ACT_PUSH_IMM8:
+        return !TINY386_JIT_ENABLE_STACK_FASTPATH;
     default:
         return false;
     }
@@ -2586,15 +2716,21 @@ static bool jit_action_enabled(const X86Action *a, int block_insn_index)
         return true;
     if (TINY386_JIT_LEVEL >= 3 && a->type == ACT_XCHG_EAX_R)
         return true;
-    if (TINY386_JIT_ENABLE_MEM_HELPERS && TINY386_JIT_LEVEL >= 3 &&
+    if ((TINY386_JIT_ENABLE_MEM_HELPERS || TINY386_JIT_ENABLE_INLINE_MEM) &&
+        TINY386_JIT_LEVEL >= 3 &&
         (a->type == ACT_MOV_RM32 || a->type == ACT_MOV_MR32))
         return true;
-    if (TINY386_JIT_ENABLE_MEM_HELPERS && TINY386_JIT_ENABLE_PUSH_IMM8 &&
+    if ((TINY386_JIT_ENABLE_MEM_HELPERS || TINY386_JIT_ENABLE_STACK_FASTPATH) &&
+        TINY386_JIT_ENABLE_PUSH_IMM8 &&
         TINY386_JIT_LEVEL >= 3 && a->type == ACT_PUSH_IMM8)
         return true;
-    if (TINY386_JIT_ENABLE_MEM_HELPERS && TINY386_JIT_LEVEL >= 3 &&
+    if ((TINY386_JIT_ENABLE_MEM_HELPERS || TINY386_JIT_ENABLE_INLINE_MEM) &&
+        TINY386_JIT_LEVEL >= 3 &&
         (a->type == ACT_CMP_RM32 || a->type == ACT_CMP_MR32 ||
-         a->type == ACT_TEST_MR32 || a->type == ACT_MOV_RM8 ||
+         a->type == ACT_TEST_MR32))
+        return true;
+    if (TINY386_JIT_ENABLE_MEM_HELPERS && TINY386_JIT_LEVEL >= 3 &&
+        (a->type == ACT_MOV_RM8 ||
          a->type == ACT_MOV_MR8 || a->type == ACT_MOV_RM16 ||
          a->type == ACT_MOV_MR16))
         return true;
@@ -2807,10 +2943,12 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         return NULL;
     }
 
+    uint32_t guest_ptr_start = jit_ccount();
     const uint8_t *x86 = (const uint8_t *)cpui386_get_phys_mem(cpu) + paddr;
     uint32_t page_left = JIT_GUEST_PAGE_SIZE - (paddr & (JIT_GUEST_PAGE_SIZE - 1u));
     uint32_t mem_left  = phys_mem_size - paddr;
     uint32_t scan_left = (page_left < mem_left) ? page_left : mem_left;
+    jit->guest_ptr_cycles += jit_cycles_since(guest_ptr_start);
 
     /* Evict the old entry if occupied by a different address */
     if (block->status == JIT_VALID && block->guest_paddr != paddr)
@@ -2851,6 +2989,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     int       x86_consumed = 0;
     uint32_t  cur_eip = eip;
     JITBailReason scan_bail = JIT_BAIL_UNSUPPORTED_OPCODE;
+    uint32_t  scan_start = jit_ccount();
 
     for (int n = 0; n < JIT_SCAN_LIMIT; n++) {
         X86Action *a = &actions[n];
@@ -2896,6 +3035,8 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
             break;
 #endif
     }
+    jit->guest_scan_cycles += jit_cycles_since(scan_start);
+    jit->guest_scan_bytes += (uint32_t)x86_consumed;
 
     if (insn_count == 0) {
         jit_mark_nojit(block, paddr, paddr, scan_bail);
@@ -3062,16 +3203,27 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
 int jit_try_execute(JITState *jit, CPUI386 *cpu)
 {
-    if (!jit->pool || cpui386_is_code16(cpu))
+    uint32_t try_start = jit_ccount();
+    uint32_t lookup_start = try_start;
+    jit->try_entries++;
+
+    if (!jit->pool || cpui386_is_code16(cpu)) {
+        jit->interp_exits++;
+        jit->try_cycles += jit_cycles_since(try_start);
         return 0;
+    }
 
     uint32_t cs_base = cpui386_get_cs_base(cpu);
     uint32_t eip     = cpui386_get_next_ip(cpu);
     uint32_t laddr   = cs_base + eip;
     uint32_t cr0 = cpui386_get_cr0(cpu);
     if (cr0 & 0x80000000u) {
-        if (laddr >= (uint32_t)cpui386_get_phys_mem_size(cpu))
+        if (laddr >= (uint32_t)cpui386_get_phys_mem_size(cpu)) {
+            jit->lookup_cycles += jit_cycles_since(lookup_start);
+            jit->interp_exits++;
+            jit->try_cycles += jit_cycles_since(try_start);
             return 0;
+        }
     }
     uint32_t paddr = laddr;
     JIT_TRACEF("[jit_trace] try eip=0x%08x paddr=0x%08x cr0=0x%08x\n",
@@ -3087,6 +3239,9 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         JIT_TRACEF("[jit_trace] nojit-table-hit paddr=0x%08x bail=%s\n",
                    (unsigned)paddr, jit_bail_reason_name(nojit_bail));
         jit_maybe_dump_stats(jit);
+        jit->lookup_cycles += jit_cycles_since(lookup_start);
+        jit->interp_exits++;
+        jit->try_cycles += jit_cycles_since(try_start);
         return 0;
     }
 
@@ -3096,6 +3251,9 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         JIT_TRACEF("[jit_trace] nojit-hit paddr=0x%08x bail=%s\n",
                    (unsigned)paddr, jit_bail_reason_name(block->bail));
         jit_maybe_dump_stats(jit);
+        jit->lookup_cycles += jit_cycles_since(lookup_start);
+        jit->interp_exits++;
+        jit->try_cycles += jit_cycles_since(try_start);
         return 0;
     }
 
@@ -3105,22 +3263,33 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         if (jit_hot_threshold_skip(jit, paddr)) {
             jit->misses++;
             jit_maybe_dump_stats(jit);
+            jit->lookup_cycles += jit_cycles_since(lookup_start);
+            jit->interp_exits++;
+            jit->try_cycles += jit_cycles_since(try_start);
             return 0;
         }
         JIT_TRACEF("[jit_trace] miss slot=%u status=%u old_paddr=0x%08x\n",
                    (unsigned)slot, (unsigned)block->status,
                    (unsigned)block->guest_paddr);
+        jit->lookup_cycles += jit_cycles_since(lookup_start);
+        uint32_t translate_start = jit_ccount();
         block = jit_translate(jit, cpu);
+        jit->translate_cycles += jit_cycles_since(translate_start);
         if (!block) {
             jit->misses++;
             JIT_TRACEF("[jit_trace] miss-bail eip=0x%08x paddr=0x%08x\n",
                        (unsigned)eip, (unsigned)paddr);
             jit_maybe_dump_stats(jit);
+            jit->interp_exits++;
+            jit->try_cycles += jit_cycles_since(try_start);
             return 0;
         }
+    } else {
+        jit->lookup_cycles += jit_cycles_since(lookup_start);
     }
 
     jit->hits++;
+    jit->block_entries++;
     jit->jit_guest_insns += (uint32_t)block->x86_insns +
                             (uint32_t)block->link_x86_insns;
 
@@ -3133,9 +3302,13 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     JIT_TRACEF("[jit_trace] exec host=%p eip=0x%08x insns=%u x86_len=%u\n",
                (void *)fn, (unsigned)eip, (unsigned)block->x86_insns,
                (unsigned)block->x86_len);
+    uint32_t exec_start = jit_ccount();
     fn(cpu);
+    jit->exec_cycles += jit_cycles_since(exec_start);
+    jit->block_exits++;
     JIT_TRACEF("[jit_trace] done host=%p next_ip=0x%08x\n",
                (void *)fn, (unsigned)cpui386_get_next_ip(cpu));
     jit_maybe_dump_stats(jit);
+    jit->try_cycles += jit_cycles_since(try_start);
     return (int)block->x86_insns + (int)block->link_x86_insns;
 }

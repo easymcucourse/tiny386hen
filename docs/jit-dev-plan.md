@@ -1252,3 +1252,19 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - Default verification: a fresh benchmark build with no explicit mem-helper override matched the gated run in 3/3 captures: VGA3 -> boot `7282.0 ms`, VGA3 -> VGA1 `19876.0 ms`, final `24/11/13` translate/trans/bail, `helper_actions=0`, and `smc_flushes=293`.
 - Normal-profile restore/smoke: flashed `TINY386_BENCH_PROFILE=0` default firmware back to COM19 and captured 45s. It reached boot at `8308 ms`, VGA1 at `20981 ms`, and had no panic/Guru/WDT.
 - Artifacts: `serial_COM19_p7_bisect_l0_run1_20260702.log/.csv/.phase.csv` through level3 run3, plus `serial_COM19_p7_gate_mem0_run1_20260702.log/.csv/.phase.csv` through run3.
+
+## 2026-07-02 Execution Record (P7 DOS image microbench and high-risk gates)
+
+- DOS image packaging done: added `tools/inject_dosbench.py`, assembled `tools/dosbench.asm` with NASM to a 987-byte `DOSBENCH.COM`, injected it into both `release/dos.img` and `release/esp/dos.img`, and patched `FDAUTO.BAT` to auto-run it when present. The injector is MBR/FAT16 aware and keeps `.bak` image backups outside the committed set.
+
+- Bench capture updated: `tools/bench_capture.py` now parses `BENCH_START`, `BENCH_CASE <name> <hex_ticks>`, and `BENCH_END`, and keeps the new P7 counters in stable CSV columns: block entry/exit counts, interpreter exits, lookup/translate/exec cycle buckets, and guest PSRAM pointer/scan buckets.
+
+- Fixed-phase 3-run DOSBENCH result with JIT disabled (`TINY386_JIT_LEVEL=0`): VGA3->VGA1 was `19906`, `19906`, `19904 ms`; DOSBENCH ticks were stable at ALU `322-323`, BRANCH `289-290`, STACK `40-41`, MEM `2-3`, SMC `0-1`.
+
+- Fixed-phase 3-run level3 default result with helper memory still disabled: VGA3->VGA1 was `19876`, `19880`, `19877 ms`; DOSBENCH ticks matched the interpreter within noise. Final snapshots showed only about `169-171` block executions over the capture and about `5900` interpreter exits. `lookup_cycles` dominated at about `20.9M`, while `exec_cycles` was only about `8-9K`; guest PSRAM address setup and scan were tiny (`guest_ptr_cycles` below `400`, `guest_scan_cycles` below `47K`). Conclusion: current JIT does not materially beat the interpreter inside DOSBENCH because coverage is too low; the remaining tax is mostly block lookup / fallback, not PSRAM guest-byte fetch.
+
+- Experimental `TINY386_JIT_ENABLE_INLINE_MEM=1` was added for direct 32-bit `MOV/CMP/TEST` guest-memory operations. Inline-only booted and ran DOSBENCH once: VGA3->VGA1 `19882 ms`, ticks ALU `323`, BRANCH `289`, STACK `40`, MEM `3`, SMC `0`. This proves the direct 32-bit path can be exercised, but it did not move the DOSBENCH needle.
+
+- Experimental `TINY386_JIT_ENABLE_STACK_FASTPATH=1` was added for direct `PUSH imm8` stack stores. Stack-fastpath-only failed the DOS phase twice: captures reached the boot sector but not VGA1 or DOSBENCH, while repeatedly translating and invalidating blocks (`hits/translations/invalidations` climbed into the hundreds of thousands). The unsafe shortcut skips SS base, stack mask/limit, page/MMIO behavior, and SMC store semantics. It remains default-off and should not be used as the next performance path without a safer segmented stack address model.
+
+- P7 decision after high-risk gate bisect: keep default firmware conservative (`MEM_HELPERS=0`, `INLINE_MEM=0`, `STACK_FASTPATH=0`, `PUSH_IMM8=0`). Inline memory is a usable experiment switch but not yet a win. Stack fast path is the current correctness hazard. The next useful optimization is reducing lookup/fallback tax and increasing translated coverage with safe stack semantics, not bypassing memory helpers globally.

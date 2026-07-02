@@ -94,6 +94,14 @@ typedef struct FPU FPU;
 #define TINY386_JIT_ENABLE_PUSH_IMM8 0
 #endif
 
+#ifndef TINY386_JIT_ENABLE_INLINE_MEM
+#define TINY386_JIT_ENABLE_INLINE_MEM 0
+#endif
+
+#ifndef TINY386_JIT_ENABLE_STACK_FASTPATH
+#define TINY386_JIT_ENABLE_STACK_FASTPATH 0
+#endif
+
 #ifndef TINY386_JIT_ENABLE_CMPTEST_JCC
 #define TINY386_JIT_ENABLE_CMPTEST_JCC 1
 #endif
@@ -131,6 +139,10 @@ typedef struct FPU FPU;
 #define JIT_CC_SRC1_OFF     856
 #define JIT_CC_SRC2_OFF     860
 #define JIT_CC_MASK_OFF     864
+
+/* CPUI386 phys_mem offsets in bytes (verified via static assert in i386.c). */
+#define JIT_PHYS_MEM_OFF       876
+#define JIT_PHYS_MEM_SIZE_OFF  880
 
 /* CPUI386 cc.op values (verified via static assert in i386.c). */
 #define JIT_CC_ADD          1
@@ -358,6 +370,17 @@ typedef struct {
     uint32_t bail_counts[JIT_BAIL_POOL_FULL + 1u];
     uint32_t unsupported_opcode_counts[JIT_UNSUPPORTED_HIST_SIZE];
     uint32_t unsupported_opcode_total;
+    uint32_t try_entries;
+    uint32_t block_entries;
+    uint32_t block_exits;
+    uint32_t interp_exits;
+    uint64_t try_cycles;
+    uint64_t lookup_cycles;
+    uint64_t translate_cycles;
+    uint64_t exec_cycles;
+    uint64_t guest_ptr_cycles;
+    uint64_t guest_scan_cycles;
+    uint32_t guest_scan_bytes;
     uint32_t stats_ticks;   /* Attempts since last periodic stats dump. */
     uint32_t snapshot_last_jit_guest_insns;
 } JITState;

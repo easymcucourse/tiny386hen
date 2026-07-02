@@ -10,6 +10,9 @@ KEYVAL_RE = re.compile(r"(\w+)=([^\s]+)")
 PERF_RE = re.compile(r"(?:\[(?P<ms>\d+)\s+ms\]\s+)?\[perf\]\s+ips=(-?\d+)\s+cycles=(-?\d+)\s+pc_steps=(\d+)\s+step_count=(\d+)")
 JIT_STATS_RE = re.compile(r"\[jit_stats\]\s+(.*)")
 MS_RE = re.compile(r"\[(\d+)\s+ms\]")
+DOSBENCH_START_RE = re.compile(r"BENCH_START(?:\s+(?P<tag>\S+))?")
+DOSBENCH_CASE_RE = re.compile(r"BENCH_CASE\s+(?P<case>\S+)\s+(?P<ticks>[0-9A-Fa-f]{4})")
+DOSBENCH_END_RE = re.compile(r"BENCH_END(?:\s+(?P<tag>\S+))?")
 PHASE_MARKERS = [
     ("sea_bios", "SeaBIOS"),
     ("set_vga_mode_3", "set VGA mode 3"),
@@ -41,6 +44,38 @@ def parse_lines(lines):
             row = parse_keyvals(line)
             row["source"] = "bench"
             rows.append(row)
+            continue
+
+        dos_case = DOSBENCH_CASE_RE.search(line)
+        if dos_case:
+            ticks_hex = dos_case.group("ticks")
+            rows.append({
+                "source": "dosbench",
+                "phase": "dosbench",
+                "dosbench_case": dos_case.group("case"),
+                "dosbench_ticks_hex": ticks_hex.upper(),
+                "dosbench_ticks": str(int(ticks_hex, 16)),
+            })
+            continue
+
+        dos_start = DOSBENCH_START_RE.search(line)
+        if dos_start:
+            rows.append({
+                "source": "dosbench",
+                "phase": "dosbench",
+                "dosbench_event": "start",
+                "dosbench_tag": dos_start.group("tag") or "",
+            })
+            continue
+
+        dos_end = DOSBENCH_END_RE.search(line)
+        if dos_end:
+            rows.append({
+                "source": "dosbench",
+                "phase": "dosbench",
+                "dosbench_event": "end",
+                "dosbench_tag": dos_end.group("tag") or "",
+            })
             continue
 
         perf = PERF_RE.search(line)
@@ -89,6 +124,11 @@ def emit_csv(rows, out):
         "smc_false_positives", "smc_overlap_invalidations",
         "linked_exits", "helper_actions", "emitted_x86_bytes",
         "emitted_host_bytes", "unsupported_total",
+        "try_entries", "block_entries", "block_exits", "interp_exits",
+        "try_cycles", "lookup_cycles", "translate_cycles", "exec_cycles",
+        "guest_ptr_cycles", "guest_scan_cycles", "guest_scan_bytes",
+        "dosbench_event", "dosbench_tag", "dosbench_case",
+        "dosbench_ticks_hex", "dosbench_ticks",
     ]
     extras = sorted({key for row in rows for key in row} - set(preferred))
     writer = csv.DictWriter(out, fieldnames=preferred + extras, extrasaction="ignore")

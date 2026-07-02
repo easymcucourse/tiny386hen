@@ -5682,6 +5682,8 @@ _Static_assert(offsetof(struct CPUI386, cc.dst2) == JIT_CC_DST2_OFF, "JIT_CC_DST
 _Static_assert(offsetof(struct CPUI386, cc.src1) == JIT_CC_SRC1_OFF, "JIT_CC_SRC1_OFF mismatch");
 _Static_assert(offsetof(struct CPUI386, cc.src2) == JIT_CC_SRC2_OFF, "JIT_CC_SRC2_OFF mismatch");
 _Static_assert(offsetof(struct CPUI386, cc.mask) == JIT_CC_MASK_OFF, "JIT_CC_MASK_OFF mismatch");
+_Static_assert(offsetof(struct CPUI386, phys_mem) == JIT_PHYS_MEM_OFF, "JIT_PHYS_MEM_OFF mismatch");
+_Static_assert(offsetof(struct CPUI386, phys_mem_size) == JIT_PHYS_MEM_SIZE_OFF, "JIT_PHYS_MEM_SIZE_OFF mismatch");
 _Static_assert(CC_ADD == JIT_CC_ADD, "CC_ADD mismatch");
 _Static_assert(CC_SUB == JIT_CC_SUB, "CC_SUB mismatch");
 _Static_assert(CC_NEG32 == JIT_CC_NEG32, "CC_NEG32 mismatch");
