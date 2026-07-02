@@ -269,3 +269,59 @@
 - Boot now prints one `[jit_config]` line with the effective runtime gate set.
   Use that serial line before each DOSBENCH capture to confirm the ini setting
   under test is actually active.
+
+### 20-Case INI Opcode DOSBENCH Matrix
+
+- Added `tools/run_ini_jit_matrix.py` to generate 20 runtime-ini test cases,
+  flash each case to the `ini` partition at `0x200000`, and capture DOSBENCH
+  with `tools/bench_capture.py`.
+- Important harness correction:
+  - The first attempted matrix used `hda = sdspi:raw` and failed before DOS
+    because this board did not mount SD (`ESP_ERR_TIMEOUT`, then
+    `sdspi:raw: No such file or directory`).
+  - The valid matrix uses `hda = flash:dos.img`, matching the DOSBENCH flash
+    image flow.
+- Board execution:
+  - Board/port: ESP32-S3 ILI9341 on `COM19`.
+  - Firmware: `build_ini_jit` with runtime `[jit]` gates.
+  - Capture duration: 90s per case.
+  - Artifacts: `build/ini_jit_matrix_flash_20260702/*.ini`,
+    `*.log`, `*.csv`, `*.phase.csv`, and `summary.csv`.
+  - 19/20 cases reached `BENCH_END AUTO`; no panic/Guru/WDT was found in the
+    valid matrix logs.
+
+| case | ALU | BRANCH | STACK | MEM | SMC | translated | block_entries | helper_actions | result |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| nojit | 328 | 293 | 41 | 3 | 0 | 0 | 0 | 0 | baseline |
+| default | 328 | 292 | 41 | 3 | 0 | 7 | 85 | 0 | no DOSBENCH gain |
+| only `6A` helper | 329 | 292 | 41 | 3 | 0 | 426 | 426 | 426 | no gain; helper tax |
+| only `6A` stackfast | - | - | - | - | - | 67 | 67 | 0 | failed before VGA1/DOSBENCH |
+| only `4A` | 328 | 293 | 42 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `40` | 328 | 293 | 42 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `48` | 328 | 293 | 42 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `50` | 329 | 292 | 41 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `58` | 328 | 293 | 42 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `89` helper | 328 | 292 | 41 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `8B` helper | 328 | 293 | 42 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `89` inline | 328 | 293 | 42 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `8B` inline | 328 | 293 | 42 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `83` | 328 | 293 | 41 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `01` | 328 | 292 | 41 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `03` | 328 | 293 | 41 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `3B` helper | 328 | 293 | 42 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `3B` inline | 328 | 293 | 42 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `74` | 328 | 293 | 41 | 3 | 0 | 0 | 0 | 0 | no coverage |
+| only `EB` | 327 | 293 | 41 | 2 | 0 | 2 | 8 | 0 | tiny coverage; noise only |
+
+- Conclusions:
+  - The only single opcode with meaningful execution volume is still `6A`
+    (`PUSH imm8`).
+  - The helper implementation translates and executes but does not improve
+    DOSBENCH; `ALU` is worse by 1 tick and other deltas are noise.
+  - The raw stack fastpath is unsafe in its current form: after 67 translated
+    `6A` blocks it stops making guest progress (`ips=0`) before VGA1 and never
+    reaches DOSBENCH.
+  - Other tested opcodes either do not appear under current decode/gate rules
+    or translate too little to matter. More opcode count alone is not a useful
+    direction; the next useful work is a safe stack/address implementation for
+    `PUSH imm8` with explicit segment, bounds, MMIO, and SMC checks.
