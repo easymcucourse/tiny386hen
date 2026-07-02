@@ -168,3 +168,36 @@
 - Keep these opcodes disabled for now. Revisit opcode work only if the histogram
   shows a hot true-unsupported opcode or if the gated opcode can be made
   flags-safe and non-helper-heavy.
+
+### DOSBENCH ASM Correction
+
+- The first NOJIT-cooldown analysis used 45s captures and reached
+  `BENCH_START`, but did not wait long enough for all `tools/dosbench.asm`
+  `BENCH_CASE` results. That was not sufficient for the opcode decision.
+- Re-ran the current NOJIT-cooldown build with three 90s captures:
+  - `serial_COM19_nojitcool4_dosbench_run1_20260702.*`
+  - `serial_COM19_nojitcool4_dosbench_run2_20260702.*`
+  - `serial_COM19_nojitcool4_dosbench_run3_20260702.*`
+- All three runs reached `BENCH_END AUTO` without panic/WDT.
+- DOSBENCH asm case ticks:
+  - `ALU`: `327, 327, 327`, mean `327.0`
+  - `BRANCH`: `292, 292, 292`, mean `292.0`
+  - `STACK`: `41, 41, 42`, mean `41.3`
+  - `MEM`: `3, 3, 2`, mean `2.7`
+  - `SMC`: `0, 0, 0`, mean `0.0`
+- Existing three-run baselines for comparison:
+  - JIT level0/interpreter:
+    - `ALU=322.7`, `BRANCH=289.3`, `STACK=40.3`, `MEM=2.3`, `SMC=0.7`
+  - JIT level3 default:
+    - `ALU=323.0`, `BRANCH=289.0`, `STACK=40.0`, `MEM=2.3`, `SMC=0.7`
+  - previous generic `cool4_nohotskip`:
+    - `ALU=323.0`, `BRANCH=288.0`, `STACK=40.7`, `MEM=2.0`, `SMC=1.0`
+- Corrected conclusion:
+  - NOJIT cooldown reduces JIT lookup/fallback accounting cost, but it does not
+    improve the DOSBENCH asm workload. On these cases it is slightly slower than
+    the existing level3/default and interpreter baselines.
+  - Opcode work should be judged by DOSBENCH asm deltas first, not by VGA phase
+    timing or by lower lookup counters alone.
+  - For now, do not enable or add opcode support just because `nojit_hot` points
+    at `6A`/`4A`. A useful opcode change must improve at least one asm case
+    without regressing the rest beyond normal 1-tick noise.
