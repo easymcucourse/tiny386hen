@@ -5353,6 +5353,26 @@ long IRAM_ATTR cpui386_get_cycle(CPUI386 *cpu)
 	return cpu->cycle;
 }
 
+void cpui386_jit_dump_perf_snapshot(CPUI386 *cpu, const char *phase,
+				     uint32_t ms, long ips, long cycles,
+				     uint32_t pc_steps, uint32_t step_count,
+				     uint32_t step_batch)
+{
+#if defined(BUILD_ESP32) && defined(TINY386_ENABLE_JIT)
+	jit_dump_perf_snapshot(&cpu->jit, phase, ms, ips, cycles,
+			       pc_steps, step_count, step_batch);
+#else
+	(void)cpu;
+	(void)phase;
+	(void)ms;
+	(void)ips;
+	(void)cycles;
+	(void)pc_steps;
+	(void)step_count;
+	(void)step_batch;
+#endif
+}
+
 bool cpui386_is_code16(CPUI386 *cpu)
 {
 	return cpu->code16;

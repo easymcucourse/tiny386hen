@@ -70,6 +70,26 @@ typedef struct FPU FPU;
 #define TINY386_JIT_UNSUPPORTED_TOP 8
 #endif
 
+#ifndef TINY386_BENCH_PROFILE
+#define TINY386_BENCH_PROFILE 0
+#endif
+
+#ifndef TINY386_JIT_ENABLE_LINKING
+#define TINY386_JIT_ENABLE_LINKING 1
+#endif
+
+#ifndef TINY386_JIT_ENABLE_MEM_HELPERS
+#define TINY386_JIT_ENABLE_MEM_HELPERS 1
+#endif
+
+#ifndef TINY386_JIT_ENABLE_CMPTEST_JCC
+#define TINY386_JIT_ENABLE_CMPTEST_JCC 1
+#endif
+
+#ifndef TINY386_JIT_ENABLE_SMC_BITMAP
+#define TINY386_JIT_ENABLE_SMC_BITMAP 1
+#endif
+
 #define JIT_UNSUPPORTED_HIST_SIZE 512u
 
 /* Guest page granularity used for future self-modifying-code tracking. */
@@ -280,6 +300,17 @@ typedef struct {
     uint32_t hits;          /* Execution stats. */
     uint32_t misses;
     uint32_t bailed;        /* Blocks that could not be compiled. */
+    uint32_t translate_attempts;
+    uint32_t translated;
+    uint32_t cache_misses;
+    uint32_t sticky_nojit_hits;
+    uint32_t jit_guest_insns;
+    uint32_t emitted_x86_bytes;
+    uint32_t emitted_host_bytes;
+    uint32_t linked_exits;
+    uint32_t helper_call_actions;
+    uint32_t host_buffer_full;
+    uint32_t pool_flushes;
     uint32_t invalidations; /* Cache entries dropped by SMC/reset. */
     uint32_t smc_flushes;   /* Page/range invalidations requested. */
     uint32_t smc_page_bitmap[JIT_SMC_PAGE_WORDS]; /* Hashed pages with translated code. */
@@ -287,6 +318,7 @@ typedef struct {
     uint32_t unsupported_opcode_counts[JIT_UNSUPPORTED_HIST_SIZE];
     uint32_t unsupported_opcode_total;
     uint32_t stats_ticks;   /* Attempts since last periodic stats dump. */
+    uint32_t snapshot_last_jit_guest_insns;
 } JITState;
 
 /* ------------------------------------------------------------------ */
@@ -331,5 +363,16 @@ void jit_invalidate_range(JITState *jit, uint32_t paddr, uint32_t size);
  * jit_invalidate_page() - flush blocks associated with one physical page.
  */
 void jit_invalidate_page(JITState *jit, uint32_t paddr);
+
+/**
+ * jit_dump_perf_snapshot() - emit one low-frequency benchmark snapshot.
+ *
+ * The caller supplies wall-time and emulator-loop counters; the backend appends
+ * JIT hit/miss/translation/cache/SMC counters in one stable line.
+ */
+void jit_dump_perf_snapshot(JITState *jit, const char *phase,
+                            uint32_t ms, long ips, long cycles,
+                            uint32_t pc_steps, uint32_t step_count,
+                            uint32_t step_batch);
 
 #endif /* JIT_X86_H */

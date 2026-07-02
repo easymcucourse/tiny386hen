@@ -46,6 +46,23 @@ static void jit_selftest_run_blocking(void)
 #ifndef PC_PERF_LOG_ENABLED
 #define PC_PERF_LOG_ENABLED 1
 #endif
+#ifndef TINY386_BENCH_PROFILE
+#define TINY386_BENCH_PROFILE 0
+#endif
+
+#if TINY386_BENCH_PROFILE
+static const char *bench_profile_name(void)
+{
+	switch (TINY386_BENCH_PROFILE) {
+	case 1:
+		return "selftest";
+	case 2:
+		return "dosmicro";
+	default:
+		return "boot";
+	}
+}
+#endif
 
 //
 #include "esp_private/system_internal.h"
@@ -372,6 +389,11 @@ static int pc_main(const char *file)
 			fprintf(stderr,
 				"[perf] ips=%ld cycles=%ld pc_steps=%lu step_count=%d\n",
 				ips, cycle_delta, (unsigned long)iter_delta, PC_STEP_COUNT);
+#if TINY386_BENCH_PROFILE
+			cpui386_jit_dump_perf_snapshot(pc->cpu, bench_profile_name(),
+				(uint32_t)((perf_now_us - pc->boot_start_time) / 1000u),
+				ips, cycle_delta, iter_delta, step_count, PC_STEP_COUNT);
+#endif
 			perf_last_us = perf_now_us;
 			perf_last_steps = step_count;
 			perf_last_cycles = perf_cycles;

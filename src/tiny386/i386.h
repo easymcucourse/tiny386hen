@@ -50,6 +50,10 @@ void cpui386_step(CPUI386 *cpu, int stepcount);
 void cpui386_raise_irq(CPUI386 *cpu);
 void cpui386_set_gpr(CPUI386 *cpu, int i, u32 val);
 long cpui386_get_cycle(CPUI386 *cpu);
+void cpui386_jit_dump_perf_snapshot(CPUI386 *cpu, const char *phase,
+				     uint32_t ms, long ips, long cycles,
+				     uint32_t pc_steps, uint32_t step_count,
+				     uint32_t step_batch);
 bool cpui386_is_code16(CPUI386 *cpu);
 u32 cpui386_get_cs_base(CPUI386 *cpu);
 u32 cpui386_get_next_ip(CPUI386 *cpu);

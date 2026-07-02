@@ -417,8 +417,9 @@ JIT 头文件已经拆成两层：
 | P3 | 控制流 | JMP、CMP/TEST+Jcc 融合、分支回填、块链接 | 4 | ~4 天 |
 | P4 | 缓存与自修改代码 | 逐出/flush、CR3 切换、写内存失效、精确页内失效 | 4 | ~4 天 |
 | P5 | 性能与扩面 | 基准、窄编码/最小存取、放开更多 opcode、内存操作数(长期) | 4 | ~4 天 |
+| P6 | Benchmark 与调优 | 解释 JIT 拖慢 IPS 的原因，建立可复现实验矩阵与调优闭环 | 6 | ~6 天 |
 
-总计 ≈ 27 个 task ≈ 27 个工作日。每个 task 控制在 2 小时内（含构建/板上验证），做不完就拆。
+总计 ≈ 33 个 task ≈ 33 个工作日。每个 task 控制在 2 小时内（含构建/板上验证），做不完就拆。
 
 ---
 
@@ -965,6 +966,93 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 
 ---
 
+### 阶段 P6：Benchmark 与调优闭环
+
+> 背景：2026-07-02 之后观察到若干窗口中 JIT 会拖慢 `ips`。这不能只用“opcode 覆盖不足”
+> 一句话解释，因为当前 JIT 还叠加了 PSRAM 取指、C helper-call、block 进入/返回、translation/cache
+> miss、SMC invalidation、串口 stats 输出、以及混合 JIT/解释器调度等成本。P6 的目标是先把这些成本分解成
+> 可复现的数字，再决定是继续扩 opcode、优化 dispatch/linking、inline memory fast path，还是对某些块主动
+> NOJIT。
+
+#### P6.0 — 性能判据与实验纪律
+
+- **主判据**：不要只看瞬时 `ips`。每个实验必须同时记录 wall time、guest cycles、`pc_steps`、
+  `step_count`、JIT hits/misses/bailed、host buffer full、pool epoch、SMC flush、unsupported top opcode。
+- **对照组**：至少保留 `JIT_LEVEL=0`、当前默认 level3、以及“只开一个候选优化/只关一个可疑功能”的 A/B 组。
+- **窗口固定**：启动 benchmark 必须用固定时间点/事件点切片，例如：
+  - `SeaBIOS start -> set VGA mode`
+  - `set VGA mode -> Booting from 0000:7c00`
+  - `Booting from 0000:7c00 -> DOS prompt/固定程序入口`
+  - DOS 内部 microbench 固定循环
+- **串口扰动控制**：stats dump 默认低频；做精确 benchmark 时只允许事件边界输出摘要，禁止逐块 trace。
+- **结论门槛**：小于 5% 的单次差异只记录为噪声；需要 3 次重复同方向才允许写成“改善/退化”。
+- **回滚规则**：任何优化若 selftest PASS 但固定 benchmark 退化超过 10%，默认 gate 关闭，留下可复现实验记录。
+
+#### Task 6.1 — benchmark harness 与日志格式
+
+- **目标**：建立板上可重复的 benchmark harness，让不同 JIT gate 的结果可比。
+- **范围(≈2h)**：新增统一 perf snapshot 输出，记录 phase id、ms、ips、cycles、pc_steps、JIT stats、top unsupported；
+  支持通过 CMake cache 标记 benchmark profile（normal boot / selftest / DOS microbench）。
+- **涉及文件**：`jit_x86.h`、`jit_lx7.c`、`esp_main.c` 或现有 perf 输出点，必要时新增 `tools/bench_capture.py`。
+- **验收**：同一固件连续 3 次 45 秒 capture 可自动提取 phase 表；不开 benchmark profile 时正常日志不明显变多。
+- **风险**：串口本身会拖慢系统；输出必须是低频摘要，不允许每个 block 打印。
+
+#### Task 6.2 — JIT 成本分解计数器
+
+- **目标**：区分“JIT 执行慢”与“JIT 没命中/翻译/失效/回退导致慢”。
+- **范围(≈2h)**：增加计数器：translate attempts、successful translations、cache hits、cache misses、sticky nojit hits、
+  emitted bytes、x86 bytes、linked exits、helper-call actions、host_buffer_full、pool flush、SMC invalidations。
+- **涉及文件**：`jit_x86.h`、`jit_lx7.c`。
+- **验收**：45 秒启动日志能看出每个 phase 的 JIT 有效执行比例，例如 `jit_guest_insns / total_guest_insns`，
+  并能定位退化来自 miss/bailed 还是来自 valid block 执行成本。
+- **风险**：计数器更新本身也有开销；高频字段使用整数累加，避免格式化输出进入热路径。
+
+#### Task 6.3 — 固定 DOS microbench 套件
+
+- **目标**：用可控 guest 程序隔离不同类型的 JIT 收益/退化，不再只依赖启动窗口。
+- **范围(≈2h 起)**：扩展 `tools/dosbench.asm` 或新增 DOS `.COM`，至少包含：
+  - register ALU tight loop
+  - branch taken/not-taken loop
+  - stack `PUSH/POP/CALL/RET` loop
+  - memory MOV/CMP/TEST loop
+  - SMC/写代码压力小用例
+- **涉及文件**：`tools/dosbench.asm`、DOS 镜像打包脚本/说明、`docs/` benchmark 记录。
+- **验收**：每个 microbench 能输出固定迭代数耗时或 cycle；JIT level0/level3 至少跑 3 次并记录均值。
+- **风险**：DOS 程序的计时源可能受模拟器自身影响；优先用 emulator 内部 cycle/perf 计数交叉验证。
+
+#### Task 6.4 — gate 矩阵与二分定位
+
+- **目标**：找出拖慢 IPS 的具体 gate，而不是把“JIT”当成一个整体开关。
+- **范围(≈2h)**：把高风险 gate 拆成 CMake cache 开关，至少包括：block linking、memory helper-call actions、
+  CMP/TEST+Jcc fusion、JMP、unsupported histogram、SMC bitmap/range path、future stack ops。
+- **涉及文件**：`make/esp-ili9341/main/CMakeLists.txt`、`jit_lx7.c`。
+- **验收**：能生成一张 A/B 表：每行一个 gate，列出 selftest、45 秒 boot phase、DOS microbench 的相对变化。
+- **风险**：gate 组合爆炸；每轮只做单变量差异，禁止混合多个未知改动得出结论。
+
+#### Task 6.5 — 热块与冷块策略
+
+- **目标**：避免把只执行一次或频繁 bail 的冷块编译进 JIT，减少 translation/cache 成本。
+- **范围(≈2h 起)**：记录每个 paddr 的解释器命中次数或 sticky nojit 次数；尝试热度阈值，例如同一 paddr 第 N 次执行才翻译；
+  对 host_buffer_full/pool churn 明显的块主动 NOJIT 或缩短扫描。
+- **涉及文件**：`jit_x86.h`、`jit_lx7.c`、可能涉及 `i386.c` 调度路径。
+- **验收**：启动 benchmark 中 miss/translate 次数下降；wall time/ips 不低于默认策略；selftest PASS。
+- **风险**：热度阈值可能延迟真正热路径加速；需要按 phase 分析，不能只看总数。
+
+#### Task 6.6 — 调优决策表与下一步路线
+
+- **目标**：把 P6 数据转成明确工程决策。
+- **范围(≈2h)**：维护 `docs/jit-benchmark-results.md` 或本文件附录表，按收益/风险排序：
+  - 继续扩 opcode（例如 5.5 已显示 `6A PUSH imm8` 热）
+  - 优化 block dispatch/linking
+  - inline memory fast path
+  - 调低/关闭某些 gate
+  - 改变块扫描长度或热度阈值
+- **涉及文件**：`docs/`。
+- **验收**：每个候选优化都有“证据、预计收益、风险、回退开关、验证用例”；没有数据的优化不得进入默认 gate。
+- **风险**：benchmark 过拟合单一启动路径；必须同时保留 DOS microbench 与真实启动 smoke 两类证据。
+
+---
+
 ## 4. 每日执行模板（给 Codex 的统一指令骨架）
 
 > 把下面这段当作每天那个 task 的"系统提示"，替换 `{TASK_ID}`：
@@ -1043,3 +1131,17 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - Task 5.8 done: expanded `MemOp` to model base/index/scale/disp SIB addressing, including `index=ESP` as no-index and `base=EBP && mod=0` as no-base + disp32. Current consumers are the conservative memory MOV/CMP/TEST helper-call paths.
 - Task 5.9 decision: not enabled. The new 5.5 histogram shows the dominant miss is `PUSH imm8` (`6A`), not memory helper-call overhead, so inline memory fast paths remain deferred to avoid bypassing paging/MMIO/SMC semantics without evidence.
 - Verification: COM19 selftest-only firmware reported `119/119 PASS`. Normal firmware was rebuilt and app-flashed back to COM19; a 45s capture reached SeaBIOS, `set VGA mode 3`, `Booting from 0000:7c00`, and periodic perf/stats output with no WDT or panic.
+
+## 2026-07-02 Execution Record (P6 benchmark and tuning loop)
+
+- Task 6.1 done: added a low-frequency `[bench]` perf snapshot path, gated by `TINY386_BENCH_PROFILE`. The snapshot includes phase id, wall time, ips, guest cycle delta, `pc_steps`, `step_count`, JIT hit/miss counters, translation counters, SMC/pool counters, helper/link counters, emitted bytes, and unsupported total. Normal profile `0` keeps the existing log volume.
+- Task 6.2 done: split JIT costs into counters for translate attempts, successful translations, cache misses, sticky NOJIT hits, JIT guest instructions, emitted x86/host bytes, linked exits, helper-call actions, host-buffer-full, and pool flushes.
+- Task 6.3 done: expanded `tools/dosbench.asm` into fixed ALU, branch, stack, memory, and SMC cases with stable `BENCH_CASE` output. NASM assembled it locally to a 987-byte `.COM`.
+- Task 6.4 done: added CMake cache A/B gates for block linking, memory helper actions, CMP/TEST+Jcc fusion, SMC bitmap prefilter, benchmark profile selection, and unsupported histogram.
+- Task 6.5 done as a measurement hook rather than default policy change: the new counters can show miss/translate churn and sticky NOJIT pressure; no hot/cold threshold is enabled by default until repeated captures prove it helps.
+- Task 6.6 done: added `docs/jit-benchmark-results.md` with protocol, capture commands, gate matrix, current optimization decisions, and an empty results matrix for repeated runs.
+- Tooling: added `tools/bench_capture.py`, which can capture serial or parse existing logs and emit a CSV phase table. It understands both new `[bench]` snapshots and older `[perf]` + `[jit_stats]` output.
+- Verification: default ILI9341 firmware builds successfully with ESP-IDF 5.5.1. A separate benchmark build also succeeds with `-DTINY386_BENCH_PROFILE=2 -DTINY386_JIT_ENABLE_LINKING=0`, proving the profile/gate chain works. Local parser sample and DOS bench NASM assembly passed.
+- Board note: this workstation currently enumerates COM101 and Bluetooth COM11, not the historical COM19 port, so no app-flash or 45-second board capture was run in this slice. The P6 harness is ready for the next board capture once the active board port is confirmed.
+- COM19 follow-up: COM19 reappeared as `USB-SERIAL CH340K`. The first app-flash/capture hit an early `debugcon` task stack overflow before BIOS; `DEBUGCON_TASK_STACK` was raised from 2048 to 4096 and the benchmark firmware was rebuilt/flashed. A 45s COM19 capture then reached SeaBIOS, `set VGA mode 3`, `Booting from 0000:7c00`, and emitted `[bench]` snapshots with no panic/WDT. Capture artifacts: `serial_COM19_p6_bench_20260702_090304.log` and `.csv`.
+- COM19 P6 sample result (`TINY386_BENCH_PROFILE=2`, `TINY386_JIT_ENABLE_LINKING=0`): at about 40.0s, `ips=10665`, `cycles=53326`, `pc_steps=304320`, `jit_hits=189`, `jit_misses=1859`, `translate_attempts=1613`, `translated=25`, `bailed=1588`, `sticky_nojit=271`, `host_buffer_full=8`, `smc_flushes=430`, `invalidations=25`, `helper_actions=14`, `unsupported_opcode_total=1442` in the snapshot; the later periodic stats dump showed `unsupported_opcode_total=1580`, led by `6a` with 1551 hits. This reinforces the P5.9 decision that `PUSH imm8` is the next evidence-backed opcode target, while inline memory fast path remains deferred.

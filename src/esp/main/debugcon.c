@@ -18,7 +18,7 @@
 #endif
 
 #ifndef DEBUGCON_TASK_STACK
-#define DEBUGCON_TASK_STACK 2048
+#define DEBUGCON_TASK_STACK 4096
 #endif
 
 void *psmalloc(long size);
