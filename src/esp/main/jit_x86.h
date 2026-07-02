@@ -82,8 +82,24 @@ typedef struct FPU FPU;
 #define TINY386_JIT_SELFTEST_AT_BOOT 0
 #endif
 
+#ifndef TINY386_JIT_LEVEL
+#define TINY386_JIT_LEVEL 0
+#endif
+
 #ifndef TINY386_JIT_ENABLE_LINKING
 #define TINY386_JIT_ENABLE_LINKING 1
+#endif
+
+#ifndef TINY386_JIT_ENABLE_MOV_RR
+#define TINY386_JIT_ENABLE_MOV_RR 1
+#endif
+
+#ifndef TINY386_JIT_ENABLE_MOV_RI
+#define TINY386_JIT_ENABLE_MOV_RI 1
+#endif
+
+#ifndef TINY386_JIT_ENABLE_JMP
+#define TINY386_JIT_ENABLE_JMP 0
 #endif
 
 #ifndef TINY386_JIT_ENABLE_MEM_HELPERS
@@ -432,9 +448,25 @@ typedef struct {
     uint32_t snapshot_last_jit_guest_insns;
 } JITState;
 
+typedef struct {
+    int level;
+    int only_opcode;
+    uint8_t enable_mov_ri;
+    uint8_t enable_mov_rr;
+    uint8_t enable_jmp;
+    uint8_t enable_mem_helpers;
+    uint8_t enable_push_imm8;
+    uint8_t enable_inline_mem;
+    uint8_t enable_stack_fastpath;
+    uint8_t enable_cmptest_jcc;
+} JITRuntimeConfig;
+
 /* ------------------------------------------------------------------ */
 /* Public backend API                                                  */
 /* ------------------------------------------------------------------ */
+
+void jit_get_runtime_config(JITRuntimeConfig *config);
+void jit_set_runtime_config(const JITRuntimeConfig *config);
 
 /**
  * jit_init() - must be called once before any translation.

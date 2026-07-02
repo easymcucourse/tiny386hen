@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stdatomic.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
@@ -24,6 +25,7 @@
 #include "startup_splash.h"
 #include "timestamp_stdio.h"
 #ifdef BUILD_ESP32
+#include "jit_x86.h"
 #include "jit_selftest.h"
 #include "esp_rom_sys.h"
 #include "esp_task_wdt.h"
@@ -429,6 +431,9 @@ struct esp_ini_config {
 	char ssid[16];
 	char pass[32];
 	int enable_usb;
+#ifdef BUILD_ESP32
+	JITRuntimeConfig jit_config;
+#endif
 };
 
 void usb_setup(void);
@@ -485,6 +490,82 @@ void *fbmalloc(long size)
 	return fb;
 }
 
+static const char *skip_ini_space(const char *s)
+{
+	while (*s == ' ' || *s == '\t')
+		s++;
+	return s;
+}
+
+static int ini_char_lower(int c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A' + 'a';
+	return c;
+}
+
+static int ini_value_is(const char *value, const char *word)
+{
+	value = skip_ini_space(value);
+	while (*value && *word) {
+		if (ini_char_lower((unsigned char)*value) !=
+		    ini_char_lower((unsigned char)*word))
+			return 0;
+		value++;
+		word++;
+	}
+	value = skip_ini_space(value);
+	return *value == '\0' && *word == '\0';
+}
+
+static int parse_ini_bool(const char *value)
+{
+	if (ini_value_is(value, "true") || ini_value_is(value, "yes") ||
+	    ini_value_is(value, "on"))
+		return 1;
+	if (ini_value_is(value, "false") || ini_value_is(value, "no") ||
+	    ini_value_is(value, "off"))
+		return 0;
+	return (int)strtol(value, NULL, 0) != 0;
+}
+
+static int parse_ini_int(const char *value)
+{
+	return (int)strtol(skip_ini_space(value), NULL, 0);
+}
+
+static int parse_ini_opcode(const char *value)
+{
+	value = skip_ini_space(value);
+	if (*value == '\0' || ini_value_is(value, "off") ||
+	    ini_value_is(value, "none"))
+		return -1;
+	return parse_ini_int(value);
+}
+
+#ifdef BUILD_ESP32
+static void apply_jit_runtime_config(const struct esp_ini_config *config)
+{
+	const JITRuntimeConfig *jit = &config->jit_config;
+
+	jit_set_runtime_config(jit);
+	fprintf(stderr,
+	        "[jit_config] level=%d only_opcode=%d mov_ri=%u mov_rr=%u jmp=%u "
+	        "mem_helpers=%u push_imm8=%u inline_mem=%u stack_fastpath=%u "
+	        "cmptest_jcc=%u\n",
+	        jit->level,
+	        jit->only_opcode,
+	        (unsigned)jit->enable_mov_ri,
+	        (unsigned)jit->enable_mov_rr,
+	        (unsigned)jit->enable_jmp,
+	        (unsigned)jit->enable_mem_helpers,
+	        (unsigned)jit->enable_push_imm8,
+	        (unsigned)jit->enable_inline_mem,
+	        (unsigned)jit->enable_stack_fastpath,
+	        (unsigned)jit->enable_cmptest_jcc);
+}
+#endif
+
 static int parse_ini(void* user, const char* section,
 		     const char* name, const char* value)
 {
@@ -504,6 +585,35 @@ static int parse_ini(void* user, const char* section,
 			i2s_set_output_volume_percent(atoi(value));
 		}
 	}
+#ifdef BUILD_ESP32
+	if (SEC("jit")) {
+		JITRuntimeConfig *jit = &conf->jit_config;
+
+		if (NAME("level")) {
+			jit->level = parse_ini_int(value);
+		} else if (NAME("enable")) {
+			jit->level = parse_ini_bool(value) ? jit->level : 0;
+		} else if (NAME("only_opcode") || NAME("opcode")) {
+			jit->only_opcode = parse_ini_opcode(value);
+		} else if (NAME("mov_ri")) {
+			jit->enable_mov_ri = parse_ini_bool(value);
+		} else if (NAME("mov_rr")) {
+			jit->enable_mov_rr = parse_ini_bool(value);
+		} else if (NAME("jmp")) {
+			jit->enable_jmp = parse_ini_bool(value);
+		} else if (NAME("mem_helpers")) {
+			jit->enable_mem_helpers = parse_ini_bool(value);
+		} else if (NAME("push_imm8")) {
+			jit->enable_push_imm8 = parse_ini_bool(value);
+		} else if (NAME("inline_mem")) {
+			jit->enable_inline_mem = parse_ini_bool(value);
+		} else if (NAME("stack_fastpath")) {
+			jit->enable_stack_fastpath = parse_ini_bool(value);
+		} else if (NAME("cmptest_jcc")) {
+			jit->enable_cmptest_jcc = parse_ini_bool(value);
+		}
+	}
+#endif
 #undef SEC
 #undef NAME
 	return 1;
@@ -596,6 +706,9 @@ void app_main(void)
 		NULL,
 	};
 	static struct esp_ini_config config;
+#ifdef BUILD_ESP32
+	jit_get_runtime_config(&config.jit_config);
+#endif
 	if (load_ini_from_partition() == 0) {
 		if (ini_parse_string(s_ini_partition_text, parse_ini, &config) == 0) {
 			config.filename = INI_PARTITION_SOURCE;
@@ -611,6 +724,9 @@ void app_main(void)
 		}
 	}
 	assert(config.filename);
+#ifdef BUILD_ESP32
+	apply_jit_runtime_config(&config);
+#endif
 
 	{
 		PCConfig bootconf;

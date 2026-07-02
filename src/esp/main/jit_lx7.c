@@ -196,6 +196,31 @@ bool jit_pool_ready(void)
 #define TINY386_JIT_JMP_SINGLE_BLOCK 1
 #endif
 
+static JITRuntimeConfig s_jit_config = {
+    .level = TINY386_JIT_LEVEL,
+    .only_opcode = TINY386_JIT_ONLY_OPCODE,
+    .enable_mov_ri = TINY386_JIT_ENABLE_MOV_RI,
+    .enable_mov_rr = TINY386_JIT_ENABLE_MOV_RR,
+    .enable_jmp = TINY386_JIT_ENABLE_JMP,
+    .enable_mem_helpers = TINY386_JIT_ENABLE_MEM_HELPERS,
+    .enable_push_imm8 = TINY386_JIT_ENABLE_PUSH_IMM8,
+    .enable_inline_mem = TINY386_JIT_ENABLE_INLINE_MEM,
+    .enable_stack_fastpath = TINY386_JIT_ENABLE_STACK_FASTPATH,
+    .enable_cmptest_jcc = TINY386_JIT_ENABLE_CMPTEST_JCC,
+};
+
+void jit_get_runtime_config(JITRuntimeConfig *config)
+{
+    if (config)
+        *config = s_jit_config;
+}
+
+void jit_set_runtime_config(const JITRuntimeConfig *config)
+{
+    if (config)
+        s_jit_config = *config;
+}
+
 /* ================================================================== */
 /*  Section 1 — LX7 Binary Emitter                                    */
 /* ================================================================== */
@@ -1699,7 +1724,7 @@ static IRAM_ATTR bool emit_action(EmitPtr *p, uint8_t *buf_end,
     }
 
     case ACT_MOV_RM32:
-        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+        if (s_jit_config.enable_inline_mem) {
             GUARD(48);
             emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
             emit_l32i(p, dr, t2, 0);
@@ -1716,7 +1741,7 @@ static IRAM_ATTR bool emit_action(EmitPtr *p, uint8_t *buf_end,
         break;
 
     case ACT_MOV_MR32:
-        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+        if (s_jit_config.enable_inline_mem) {
             GUARD(48);
             emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
             emit_s32i(p, sr, t2, 0);
@@ -1800,7 +1825,7 @@ static IRAM_ATTR bool emit_action(EmitPtr *p, uint8_t *buf_end,
     }
 
     case ACT_PUSH_IMM8:
-        if (TINY386_JIT_ENABLE_STACK_FASTPATH) {
+        if (s_jit_config.enable_stack_fastpath) {
             GUARD(64);
             emit_addi(p, X86REG_TO_LX7(4), X86REG_TO_LX7(4), -4);
             emit_l32i(p, t2, cpu_reg, JIT_PHYS_MEM_OFF / 4);
@@ -2039,7 +2064,7 @@ static IRAM_ATTR bool emit_action(EmitPtr *p, uint8_t *buf_end,
     /* ---- CMP / TEST ---------------------------------------- */
     case ACT_CMP_RM32: {
         bool fd = a->flags_dead;
-        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+        if (s_jit_config.enable_inline_mem) {
             GUARD(112);
             emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
             emit_l32i(p, t2, t2, 0);
@@ -2084,7 +2109,7 @@ static IRAM_ATTR bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
     case ACT_CMP_MR32: {
         bool fd = a->flags_dead;
-        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+        if (s_jit_config.enable_inline_mem) {
             GUARD(112);
             emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
             emit_l32i(p, t2, t2, 0);
@@ -2129,7 +2154,7 @@ static IRAM_ATTR bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
     case ACT_TEST_MR32: {
         bool fd = a->flags_dead;
-        if (TINY386_JIT_ENABLE_INLINE_MEM) {
+        if (s_jit_config.enable_inline_mem) {
             GUARD(96);
             emit_guest_ptr32(p, a, cpu_reg, t0, t1, t2);
             emit_l32i(p, t2, t2, 0);
@@ -2845,14 +2870,14 @@ static IRAM_ATTR bool jit_action_uses_helper(const X86Action *a)
     case ACT_CMP_RM32:
     case ACT_CMP_MR32:
     case ACT_TEST_MR32:
-        return !TINY386_JIT_ENABLE_INLINE_MEM;
+        return !s_jit_config.enable_inline_mem;
     case ACT_MOV_RM8:
     case ACT_MOV_MR8:
     case ACT_MOV_RM16:
     case ACT_MOV_MR16:
         return true;
     case ACT_PUSH_IMM8:
-        return !TINY386_JIT_ENABLE_STACK_FASTPATH;
+        return !s_jit_config.enable_stack_fastpath;
     default:
         return false;
     }
@@ -2958,65 +2983,64 @@ static IRAM_ATTR bool jit_action_enabled(const X86Action *a, int block_insn_inde
     if (s_jit_selftest_allow != 0)
         return ((s_jit_selftest_allow >> (unsigned)a->type) & 1u) != 0;
 
-    if (TINY386_JIT_LEVEL <= 0)
+    if (s_jit_config.level <= 0)
         return false;
-#if TINY386_JIT_ONLY_OPCODE >= 0
-    if (a->opcode_key != (uint16_t)TINY386_JIT_ONLY_OPCODE)
+    if (s_jit_config.only_opcode >= 0 &&
+        a->opcode_key != (uint16_t)s_jit_config.only_opcode)
         return false;
-#endif
-    if (TINY386_JIT_LEVEL >= 1 && a->type == ACT_NOP)
+    if (s_jit_config.level >= 1 && a->type == ACT_NOP)
         return true;
-    if (TINY386_JIT_LEVEL >= 1 && TINY386_JIT_ENABLE_MOV_RI &&
+    if (s_jit_config.level >= 1 && s_jit_config.enable_mov_ri &&
         a->type == ACT_MOV_RI)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NOT_R)
+    if (s_jit_config.level >= 2 && a->type == ACT_NOT_R)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CWDE)
+    if (s_jit_config.level >= 2 && a->type == ACT_CWDE)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_CDQ)
+    if (s_jit_config.level >= 2 && a->type == ACT_CDQ)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_BSWAP_R)
+    if (s_jit_config.level >= 2 && a->type == ACT_BSWAP_R)
         return true;
-    if (TINY386_JIT_LEVEL >= 1 && TINY386_JIT_ENABLE_MOV_RR &&
+    if (s_jit_config.level >= 1 && s_jit_config.enable_mov_rr &&
         a->type == ACT_MOV_RR)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 && TINY386_JIT_ENABLE_JMP &&
+    if (s_jit_config.level >= 2 && s_jit_config.enable_jmp &&
         a->type == ACT_JMP)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 &&
+    if (s_jit_config.level >= 2 &&
         (a->type == ACT_ALU_RR || a->type == ACT_ALU_RI) &&
         (a->alu_op == ALU_ADD || a->alu_op == ALU_SUB ||
          a->alu_op == ALU_AND || a->alu_op == ALU_OR ||
          a->alu_op == ALU_XOR))
         return true;
-    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_NEG_R)
+    if (s_jit_config.level >= 2 && a->type == ACT_NEG_R)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 &&
+    if (s_jit_config.level >= 2 &&
         (a->type == ACT_INC_R || a->type == ACT_DEC_R) &&
         a->flags_dead)
         return true;
-    if (TINY386_JIT_LEVEL >= 2 && a->type == ACT_SHx_RI)
+    if (s_jit_config.level >= 2 && a->type == ACT_SHx_RI)
         return true;
-    if (TINY386_JIT_ENABLE_CMPTEST_JCC && TINY386_JIT_LEVEL >= 3 &&
+    if (s_jit_config.enable_cmptest_jcc && s_jit_config.level >= 3 &&
         (a->type == ACT_CMP_RR || a->type == ACT_CMP_RI ||
          a->type == ACT_TEST_RR || a->type == ACT_JCC))
         return true;
-    if (TINY386_JIT_LEVEL >= 3 && a->type == ACT_XCHG_EAX_R)
+    if (s_jit_config.level >= 3 && a->type == ACT_XCHG_EAX_R)
         return true;
-    if ((TINY386_JIT_ENABLE_MEM_HELPERS || TINY386_JIT_ENABLE_INLINE_MEM) &&
-        TINY386_JIT_LEVEL >= 3 &&
+    if ((s_jit_config.enable_mem_helpers || s_jit_config.enable_inline_mem) &&
+        s_jit_config.level >= 3 &&
         (a->type == ACT_MOV_RM32 || a->type == ACT_MOV_MR32))
         return true;
-    if ((TINY386_JIT_ENABLE_MEM_HELPERS || TINY386_JIT_ENABLE_STACK_FASTPATH) &&
-        TINY386_JIT_ENABLE_PUSH_IMM8 &&
-        TINY386_JIT_LEVEL >= 3 && a->type == ACT_PUSH_IMM8)
+    if ((s_jit_config.enable_mem_helpers || s_jit_config.enable_stack_fastpath) &&
+        s_jit_config.enable_push_imm8 &&
+        s_jit_config.level >= 3 && a->type == ACT_PUSH_IMM8)
         return true;
-    if ((TINY386_JIT_ENABLE_MEM_HELPERS || TINY386_JIT_ENABLE_INLINE_MEM) &&
-        TINY386_JIT_LEVEL >= 3 &&
+    if ((s_jit_config.enable_mem_helpers || s_jit_config.enable_inline_mem) &&
+        s_jit_config.level >= 3 &&
         (a->type == ACT_CMP_RM32 || a->type == ACT_CMP_MR32 ||
          a->type == ACT_TEST_MR32))
         return true;
-    if (TINY386_JIT_ENABLE_MEM_HELPERS && TINY386_JIT_LEVEL >= 3 &&
+    if (s_jit_config.enable_mem_helpers && s_jit_config.level >= 3 &&
         (a->type == ACT_MOV_RM8 ||
          a->type == ACT_MOV_MR8 || a->type == ACT_MOV_RM16 ||
          a->type == ACT_MOV_MR16))

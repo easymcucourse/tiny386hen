@@ -242,3 +242,30 @@
   - Therefore neither hot opcode should be enabled as-is. The next useful test
     is not "more opcodes" broadly; it is a safe, non-helper implementation that
     shows a positive DOSBENCH case delta when enabled alone.
+
+### Runtime INI Opcode Gates
+
+- Added runtime `[jit]` keys so single-opcode DOSBENCH tests no longer require
+  rebuilding the main firmware for each opcode:
+  - `level`: runtime replacement for `TINY386_JIT_LEVEL`; `0` is the NOJIT
+    baseline, `3` is the current full action gate level.
+  - `only_opcode` / `opcode`: runtime replacement for
+    `TINY386_JIT_ONLY_OPCODE`; accepts decimal or hex such as `0x6A`, and `-1`,
+    `off`, or `none` restores normal multi-opcode gating.
+  - `push_imm8`, `mem_helpers`, `inline_mem`, `stack_fastpath`,
+    `cmptest_jcc`, `mov_ri`, `mov_rr`, `jmp`: runtime replacements for the
+    matching action gates. Omitted keys keep the firmware build defaults.
+- Example DOSBENCH asm test matrix using only `tiny386.ini` changes:
+  - NOJIT baseline:
+    - `[jit] level = 0`
+  - only `6A` (`PUSH imm8`) helper test:
+    - `[jit] level = 3`
+    - `only_opcode = 0x6A`
+    - `push_imm8 = 1`
+    - `mem_helpers = 1`
+  - only `4A` (`DEC EDX`) test:
+    - `[jit] level = 3`
+    - `only_opcode = 0x4A`
+- Boot now prints one `[jit_config]` line with the effective runtime gate set.
+  Use that serial line before each DOSBENCH capture to confirm the ini setting
+  under test is actually active.
