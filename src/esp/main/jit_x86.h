@@ -122,10 +122,16 @@ typedef struct FPU FPU;
 #define TINY386_JIT_PRESTEP_COOLDOWN_HOTSKIP 0
 #endif
 
+#ifndef TINY386_JIT_PRESTEP_COOLDOWN_NOJIT
+#define TINY386_JIT_PRESTEP_COOLDOWN_NOJIT 4
+#endif
+
 #define JIT_UNSUPPORTED_HIST_SIZE 512u
 
 #define JIT_NOJIT_ENTRIES 512u
 #define JIT_HOT_ENTRIES   512u
+#define JIT_NOJIT_HIST_ENTRIES 32u
+#define JIT_NOJIT_HIST_TOP     8u
 
 /* Guest page granularity used for future self-modifying-code tracking. */
 #define JIT_GUEST_PAGE_SIZE 4096u
@@ -311,6 +317,8 @@ typedef struct {
     uint8_t  valid;
     uint8_t  reserved;
     uint16_t bail;
+    uint16_t opcode_key;
+    uint16_t reserved2;
 } JITNojitEntry;
 
 typedef struct {
@@ -319,6 +327,15 @@ typedef struct {
     uint8_t  hits;
     uint16_t reserved;
 } JITHotEntry;
+
+typedef struct {
+    uint32_t guest_paddr;
+    uint32_t hits;
+    uint16_t bail;
+    uint16_t opcode_key;
+    uint8_t  valid;
+    uint8_t  reserved[3];
+} JITNojitHistEntry;
 
 /* ------------------------------------------------------------------ */
 /* One cached basic block                                              */
@@ -367,6 +384,7 @@ typedef struct {
     uint32_t miss_translate_bail;
     uint32_t nojit_table_sets;
     uint32_t hot_threshold_skips;
+    uint32_t nojit_cooldown_sets;
     uint32_t jit_guest_insns;
     uint32_t emitted_x86_bytes;
     uint32_t emitted_host_bytes;
@@ -388,6 +406,7 @@ typedef struct {
     uint32_t pool_full_invalidations;
     uint32_t smc_page_bitmap[JIT_SMC_PAGE_WORDS]; /* Hashed pages with translated code. */
     JITNojitEntry nojit_table[JIT_NOJIT_ENTRIES];
+    JITNojitHistEntry nojit_hist[JIT_NOJIT_HIST_ENTRIES];
     JITHotEntry hot_table[JIT_HOT_ENTRIES];
     uint32_t bail_counts[JIT_BAIL_POOL_FULL + 1u];
     uint32_t unsupported_opcode_counts[JIT_UNSUPPORTED_HIST_SIZE];

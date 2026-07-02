@@ -84,3 +84,87 @@
   - lower `miss_nojit_table`
   - lower `lookup_cycles`
   - no regression in VGA3 to VGA1 phase timing
+
+## 2026-07-02 NOJIT Suppression and Opcode Triage
+
+### Plan Added and Executed
+
+- Add NOJIT-specific suppression/cooldown instead of treating every persistent
+  NOJIT table hit as another full JIT miss path.
+- Add a NOJIT hot histogram by physical address, bail reason, opcode key, and
+  hit count, so opcode work can be chosen from actual repeated fallbacks.
+- Decide whether adding more opcode support is useful only after the histogram
+  identifies a hot true-unsupported opcode.
+
+### Implementation
+
+- Added `TINY386_JIT_PRESTEP_COOLDOWN_NOJIT`, default `4`, and wired it through
+  the ESP-IDF build cache.
+- On NOJIT table hits and sticky NOJIT hits, set the short prestep cooldown and
+  count it with `nojit_cooldown_sets`.
+- Added `nojit_hot` reporting for top NOJIT entries:
+  `paddr`, `bail`, `op`, and `hits`.
+- Updated `tools/bench_capture.py` with the new `nojit_cooldown_sets` column and
+  fixed `nojit_hot hits=` parsing so it does not overwrite `jit_hits`.
+
+### Validation
+
+- `git diff --check`: passed, with only CRLF normalization warnings.
+- ESP-IDF benchmark build passed:
+  - `idf.py -C make/esp-ili9341 -B build_ili9341 -DBOARD=ili9341 -DTINY386_BENCH_PROFILE=2 build`
+- Flashed COM19 successfully.
+- Captured three 45s benchmark runs:
+  - `serial_COM19_nojitcool4_run1_20260702.*`
+  - `serial_COM19_nojitcool4_run2_20260702.*`
+  - `serial_COM19_nojitcool4_run3_20260702.*`
+
+### Three-Run Result
+
+- Phase timing:
+  - VGA3 to boot sector mean: `7351.0 ms`
+  - boot sector to VGA1 mean: `12546.7 ms`
+  - VGA3 to VGA1 mean: `19897.7 ms`
+- Final 40s snapshot means:
+  - `jit_hits=85.0`
+  - `jit_misses=223.3`
+  - apparent hit rate: about `27.6%`
+  - `try_entries=2822.3`
+  - `block_entries=85.0`
+  - `miss_nojit_table=182.0`
+  - `miss_hot_skip=34.3`
+  - `miss_translate_bail=7.0`
+  - `cache_misses=48.3`, all from `cache_empty`
+  - `cache_conflict=0`
+  - `smc_overlap_invalidations=0`
+  - `smc_blocks_invalidated=0`
+  - `full_flushes=23134.7`
+  - `full_flush_invalidations=7.0`
+  - `helper_actions=0`
+  - `unsupported_total=7.0`
+  - `lookup_cycles=354985.7`
+  - `prestep_cooldown_skips=727.3`
+  - `nojit_cooldown_sets=182.0`
+- Compared with the previous no-NOJIT-cooldown run:
+  - `miss_nojit_table`: `885.7` -> `182.0`, down about `79%`
+  - `jit_misses`: `945.7` -> `223.3`, down about `76%`
+  - `lookup_cycles`: `681967.7` -> `354985.7`, down about `48%`
+  - VGA3 to VGA1: `19881.7 ms` -> `19897.7 ms`, effectively unchanged
+
+### Opcode Decision
+
+- Final `nojit_hot` entries were stable across the three runs:
+  - `paddr=0x00110890 bail=disabled op=6a hits=77-82`
+  - `paddr=0x001108a4 bail=disabled op=6a hits=45-50`
+  - `paddr=0x000f37b9 bail=disabled op=4a hits=46`
+  - `paddr=0x000f37ad bail=unsupported_opcode op=02 hits=8`
+  - `paddr=0x000f37ba bail=unsupported_opcode op=c6 hits=1`
+- More opcode coverage is not the next high-confidence fix. The hot entries are
+  mostly `bail=disabled`, not true missing decode:
+  - `6A` is `PUSH imm8`, already present behind a gate; earlier P7 testing made
+    it look net-negative/helper-heavy when enabled.
+  - `4A` is `DEC r32`, also a gated/unsafe-flags case rather than a missing
+    decoder.
+  - True unsupported `02` and `C6` are currently low-frequency in this window.
+- Keep these opcodes disabled for now. Revisit opcode work only if the histogram
+  shows a hot true-unsupported opcode or if the gated opcode can be made
+  flags-safe and non-helper-heavy.

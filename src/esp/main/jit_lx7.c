@@ -2369,6 +2369,8 @@ static IRAM_ATTR bool emit_action(EmitPtr *p, uint8_t *buf_end,
 
 static uint32_t s_jit_selftest_allow;
 
+#define JIT_OPCODE_KEY_NONE 0xffffu
+
 static inline uint32_t jit_hash(uint32_t paddr)
 {
     /* Simple hash: Knuth multiplicative hash */
@@ -2386,7 +2388,8 @@ static inline uint32_t jit_hot_hash(uint32_t paddr)
 }
 
 static bool jit_nojit_lookup(const JITState *jit, uint32_t paddr,
-                             JITBailReason *bail_out)
+                             JITBailReason *bail_out,
+                             uint16_t *opcode_key_out)
 {
     const JITNojitEntry *entry = &jit->nojit_table[jit_nojit_hash(paddr)];
 
@@ -2394,16 +2397,20 @@ static bool jit_nojit_lookup(const JITState *jit, uint32_t paddr,
         return false;
     if (bail_out)
         *bail_out = (JITBailReason)entry->bail;
+    if (opcode_key_out)
+        *opcode_key_out = entry->opcode_key;
     return true;
 }
 
-static void jit_nojit_mark(JITState *jit, uint32_t paddr, JITBailReason bail)
+static void jit_nojit_mark(JITState *jit, uint32_t paddr, JITBailReason bail,
+                           uint16_t opcode_key)
 {
     JITNojitEntry *entry = &jit->nojit_table[jit_nojit_hash(paddr)];
 
     entry->guest_paddr = paddr;
     entry->valid = 1;
     entry->bail = (uint16_t)bail;
+    entry->opcode_key = opcode_key;
     jit->nojit_table_sets++;
 }
 
@@ -2513,6 +2520,81 @@ static void jit_count_unsupported_opcode(JITState *jit, const uint8_t *x86,
 #endif
 }
 
+static void jit_count_nojit_hit(JITState *jit, uint32_t paddr,
+                                JITBailReason bail, uint16_t opcode_key)
+{
+    JITNojitHistEntry *empty = NULL;
+    JITNojitHistEntry *weakest = &jit->nojit_hist[0];
+
+    for (unsigned i = 0; i < JIT_NOJIT_HIST_ENTRIES; i++) {
+        JITNojitHistEntry *entry = &jit->nojit_hist[i];
+
+        if (entry->valid && entry->guest_paddr == paddr &&
+            entry->bail == (uint16_t)bail &&
+            entry->opcode_key == opcode_key) {
+            entry->hits++;
+            return;
+        }
+        if (!entry->valid && !empty)
+            empty = entry;
+        if (!entry->valid || entry->hits < weakest->hits)
+            weakest = entry;
+    }
+
+    JITNojitHistEntry *entry = empty ? empty : weakest;
+    entry->guest_paddr = paddr;
+    entry->hits = 1;
+    entry->bail = (uint16_t)bail;
+    entry->opcode_key = opcode_key;
+    entry->valid = 1;
+}
+
+static void jit_dump_nojit_hits(const JITState *jit)
+{
+    bool used[JIT_NOJIT_HIST_ENTRIES] = {0};
+    unsigned printed = 0;
+
+    while (printed < JIT_NOJIT_HIST_TOP) {
+        uint32_t best_hits = 0;
+        unsigned best = 0;
+
+        for (unsigned i = 0; i < JIT_NOJIT_HIST_ENTRIES; i++) {
+            const JITNojitHistEntry *entry = &jit->nojit_hist[i];
+            if (!used[i] && entry->valid && entry->hits > best_hits) {
+                best_hits = entry->hits;
+                best = i;
+            }
+        }
+        if (best_hits == 0)
+            break;
+
+        used[best] = true;
+        const JITNojitHistEntry *entry = &jit->nojit_hist[best];
+        if (entry->opcode_key == JIT_OPCODE_KEY_NONE) {
+            esp_rom_printf("[jit_stats] nojit_hot paddr=0x%08x bail=%s "
+                           "op=none hits=%u\n",
+                           (unsigned)entry->guest_paddr,
+                           jit_bail_reason_name((JITBailReason)entry->bail),
+                           (unsigned)entry->hits);
+        } else if (entry->opcode_key >= 0x100u) {
+            esp_rom_printf("[jit_stats] nojit_hot paddr=0x%08x bail=%s "
+                           "op=0f%02x hits=%u\n",
+                           (unsigned)entry->guest_paddr,
+                           jit_bail_reason_name((JITBailReason)entry->bail),
+                           entry->opcode_key & 0xffu,
+                           (unsigned)entry->hits);
+        } else {
+            esp_rom_printf("[jit_stats] nojit_hot paddr=0x%08x bail=%s "
+                           "op=%02x hits=%u\n",
+                           (unsigned)entry->guest_paddr,
+                           jit_bail_reason_name((JITBailReason)entry->bail),
+                           entry->opcode_key & 0xffu,
+                           (unsigned)entry->hits);
+        }
+        printed++;
+    }
+}
+
 static void jit_dump_unsupported_opcodes(const JITState *jit)
 {
 #if TINY386_JIT_UNSUPPORTED_HIST
@@ -2613,7 +2695,8 @@ static void jit_dump_stats(const JITState *jit)
                    "lookup_cycles=%llu translate_cycles=%llu "
                    "exec_cycles=%llu guest_ptr_cycles=%llu "
                    "guest_scan_cycles=%llu guest_scan_bytes=%u "
-                   "prestep_cooldown=%u prestep_cooldown_skips=%u\n",
+                   "prestep_cooldown=%u prestep_cooldown_skips=%u "
+                   "nojit_cooldown_sets=%u\n",
                    (unsigned)jit->try_entries,
                    (unsigned)jit->block_entries,
                    (unsigned)jit->block_exits,
@@ -2626,7 +2709,8 @@ static void jit_dump_stats(const JITState *jit)
                    (unsigned long long)jit->guest_scan_cycles,
                    (unsigned)jit->guest_scan_bytes,
                    (unsigned)jit->prestep_cooldown,
-                   (unsigned)jit->prestep_cooldown_skips);
+                   (unsigned)jit->prestep_cooldown_skips,
+                   (unsigned)jit->nojit_cooldown_sets);
     for (unsigned i = 1; i <= JIT_BAIL_POOL_FULL; i++) {
         if (jit->bail_counts[i] != 0) {
             esp_rom_printf("[jit_stats] bail %-20s %u\n",
@@ -2635,6 +2719,7 @@ static void jit_dump_stats(const JITState *jit)
         }
     }
     jit_dump_unsupported_opcodes(jit);
+    jit_dump_nojit_hits(jit);
 }
 
 static void jit_maybe_dump_stats(JITState *jit)
@@ -2686,7 +2771,7 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
                    "translate_cycles=%llu exec_cycles=%llu "
                    "guest_ptr_cycles=%llu guest_scan_cycles=%llu "
                    "guest_scan_bytes=%u prestep_cooldown=%u "
-                   "prestep_cooldown_skips=%u\n",
+                   "prestep_cooldown_skips=%u nojit_cooldown_sets=%u\n",
                    phase ? phase : "boot",
                    (unsigned)ms, ips, cycles,
                    (unsigned)pc_steps, (unsigned)step_count,
@@ -2742,8 +2827,10 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
                    (unsigned long long)jit->guest_scan_cycles,
                    (unsigned)jit->guest_scan_bytes,
                    (unsigned)jit->prestep_cooldown,
-                   (unsigned)jit->prestep_cooldown_skips);
+                   (unsigned)jit->prestep_cooldown_skips,
+                   (unsigned)jit->nojit_cooldown_sets);
     jit_dump_unsupported_opcodes(jit);
+    jit_dump_nojit_hits(jit);
 }
 
 static IRAM_ATTR bool jit_action_uses_helper(const X86Action *a)
@@ -3126,7 +3213,7 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     JITBlock *block = &jit->blocks[slot];
     JITBailReason nojit_bail = JIT_BAIL_NONE;
 
-    if (jit_nojit_lookup(jit, paddr, &nojit_bail)) {
+    if (jit_nojit_lookup(jit, paddr, &nojit_bail, NULL)) {
         JIT_TRACEF("[jit_trace] nojit-table translate-hit paddr=0x%08x bail=%s\n",
                    (unsigned)paddr, jit_bail_reason_name(nojit_bail));
         return NULL;
@@ -3140,7 +3227,8 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
 
     if (paddr >= phys_mem_size) {
         jit_mark_nojit(block, paddr, paddr, JIT_BAIL_OUT_OF_GUEST_MEM);
-        jit_nojit_mark(jit, paddr, JIT_BAIL_OUT_OF_GUEST_MEM);
+        jit_nojit_mark(jit, paddr, JIT_BAIL_OUT_OF_GUEST_MEM,
+                       JIT_OPCODE_KEY_NONE);
         jit_count_bail(jit, JIT_BAIL_OUT_OF_GUEST_MEM);
         return NULL;
     }
@@ -3246,8 +3334,15 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     jit->guest_scan_bytes += (uint32_t)x86_consumed;
 
     if (insn_count == 0) {
+        uint16_t nojit_opcode_key = JIT_OPCODE_KEY_NONE;
+        if (scan_bail == JIT_BAIL_UNSUPPORTED_OPCODE ||
+            scan_bail == JIT_BAIL_UNSUPPORTED_PREFIX ||
+            scan_bail == JIT_BAIL_DISABLED) {
+            nojit_opcode_key = jit_unsupported_key(x86 + x86_consumed,
+                                                   scan_left - (uint32_t)x86_consumed);
+        }
         jit_mark_nojit(block, paddr, paddr, scan_bail);
-        jit_nojit_mark(jit, paddr, scan_bail);
+        jit_nojit_mark(jit, paddr, scan_bail, nojit_opcode_key);
         jit_count_bail(jit, scan_bail);
         if (scan_bail == JIT_BAIL_UNSUPPORTED_OPCODE ||
             scan_bail == JIT_BAIL_UNSUPPORTED_PREFIX ||
@@ -3351,7 +3446,8 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     if (!ok || p >= code_end) {
         if (emitted_bytes == 0) {
             jit_mark_nojit(block, paddr, paddr, JIT_BAIL_HOST_BUFFER_FULL);
-            jit_nojit_mark(jit, paddr, JIT_BAIL_HOST_BUFFER_FULL);
+            jit_nojit_mark(jit, paddr, JIT_BAIL_HOST_BUFFER_FULL,
+                           JIT_OPCODE_KEY_NONE);
             jit_count_bail(jit, JIT_BAIL_HOST_BUFFER_FULL);
             return NULL;
         }
@@ -3362,7 +3458,8 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
         } else {
             jit_mark_nojit(block, paddr, paddr + (uint32_t)emitted_bytes,
                            JIT_BAIL_HOST_BUFFER_FULL);
-            jit_nojit_mark(jit, paddr, JIT_BAIL_HOST_BUFFER_FULL);
+            jit_nojit_mark(jit, paddr, JIT_BAIL_HOST_BUFFER_FULL,
+                           JIT_OPCODE_KEY_NONE);
             jit_count_bail(jit, JIT_BAIL_HOST_BUFFER_FULL);
             return NULL;
         }
@@ -3420,9 +3517,22 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         return 0;
     }
 
+#if TINY386_JIT_PRESTEP_COOLDOWN > 0 || TINY386_JIT_PRESTEP_COOLDOWN_NOJIT > 0
 #if TINY386_JIT_PRESTEP_COOLDOWN > 0
 #define JIT_SET_PRESTEP_COOLDOWN() \
     do { jit->prestep_cooldown = (uint32_t)TINY386_JIT_PRESTEP_COOLDOWN; } while (0)
+#else
+#define JIT_SET_PRESTEP_COOLDOWN() do { } while (0)
+#endif
+#if TINY386_JIT_PRESTEP_COOLDOWN_NOJIT > 0
+#define JIT_SET_NOJIT_COOLDOWN() \
+    do { \
+        jit->prestep_cooldown = (uint32_t)TINY386_JIT_PRESTEP_COOLDOWN_NOJIT; \
+        jit->nojit_cooldown_sets++; \
+    } while (0)
+#else
+#define JIT_SET_NOJIT_COOLDOWN() do { } while (0)
+#endif
     if (jit->prestep_cooldown != 0) {
         jit->prestep_cooldown--;
         jit->prestep_cooldown_skips++;
@@ -3432,6 +3542,7 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     }
 #else
 #define JIT_SET_PRESTEP_COOLDOWN() do { } while (0)
+#define JIT_SET_NOJIT_COOLDOWN() do { } while (0)
 #endif
 
     uint32_t cs_base = cpui386_get_cs_base(cpu);
@@ -3453,17 +3564,19 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     uint32_t  slot  = jit_hash(paddr);
     JITBlock *block = &jit->blocks[slot];
     JITBailReason nojit_bail = JIT_BAIL_NONE;
+    uint16_t nojit_opcode_key = JIT_OPCODE_KEY_NONE;
 
-    if (jit_nojit_lookup(jit, paddr, &nojit_bail)) {
+    if (jit_nojit_lookup(jit, paddr, &nojit_bail, &nojit_opcode_key)) {
         jit->misses++;
         jit->sticky_nojit_hits++;
         jit->miss_nojit_table++;
+        jit_count_nojit_hit(jit, paddr, nojit_bail, nojit_opcode_key);
         JIT_TRACEF("[jit_trace] nojit-table-hit paddr=0x%08x bail=%s\n",
                    (unsigned)paddr, jit_bail_reason_name(nojit_bail));
         jit_maybe_dump_stats(jit);
         jit->lookup_cycles += jit_cycles_since(lookup_start);
         jit->interp_exits++;
-        JIT_SET_PRESTEP_COOLDOWN();
+        JIT_SET_NOJIT_COOLDOWN();
         jit->try_cycles += jit_cycles_since(try_start);
         return 0;
     }
@@ -3472,12 +3585,13 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         jit->misses++;
         jit->sticky_nojit_hits++;
         jit->miss_sticky_block++;
+        jit_count_nojit_hit(jit, paddr, block->bail, JIT_OPCODE_KEY_NONE);
         JIT_TRACEF("[jit_trace] nojit-hit paddr=0x%08x bail=%s\n",
                    (unsigned)paddr, jit_bail_reason_name(block->bail));
         jit_maybe_dump_stats(jit);
         jit->lookup_cycles += jit_cycles_since(lookup_start);
         jit->interp_exits++;
-        JIT_SET_PRESTEP_COOLDOWN();
+        JIT_SET_NOJIT_COOLDOWN();
         jit->try_cycles += jit_cycles_since(try_start);
         return 0;
     }
@@ -3552,5 +3666,6 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     jit_maybe_dump_stats(jit);
     jit->try_cycles += jit_cycles_since(try_start);
 #undef JIT_SET_PRESTEP_COOLDOWN
+#undef JIT_SET_NOJIT_COOLDOWN
     return (int)block->x86_insns + (int)block->link_x86_insns;
 }

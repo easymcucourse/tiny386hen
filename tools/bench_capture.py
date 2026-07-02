@@ -94,8 +94,12 @@ def parse_lines(lines):
 
         stats = JIT_STATS_RE.search(line)
         if stats and rows:
-            for key, value in parse_keyvals(stats.group(1)).items():
-                rows[-1][STAT_KEY_MAP.get(key, key)] = value
+            stats_text = stats.group(1)
+            key_map = STAT_KEY_MAP
+            if stats_text.startswith("nojit_hot "):
+                key_map = {**STAT_KEY_MAP, "hits": "nojit_hot_hits"}
+            for key, value in parse_keyvals(stats_text).items():
+                rows[-1][key_map.get(key, key)] = value
 
     return rows
 
@@ -135,6 +139,7 @@ def emit_csv(rows, out):
         "try_cycles", "lookup_cycles", "translate_cycles", "exec_cycles",
         "guest_ptr_cycles", "guest_scan_cycles", "guest_scan_bytes",
         "prestep_cooldown", "prestep_cooldown_skips",
+        "nojit_cooldown_sets",
         "dosbench_event", "dosbench_tag", "dosbench_case",
         "dosbench_ticks_hex", "dosbench_ticks",
     ]
