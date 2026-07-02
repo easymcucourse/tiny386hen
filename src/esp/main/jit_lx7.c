@@ -511,6 +511,148 @@ static inline void emit_entry32(EmitPtr *p)
     *p += 3;
 }
 
+/* Use macros in the translation hot path to force direct byte emission. */
+#define emit_rrr(p, op2, op1, r, s, t) do {                 \
+    (*(p))[0] = (uint8_t)(((t) << 4) | 0x00);                \
+    (*(p))[1] = (uint8_t)(((r) << 4) | (s));                 \
+    (*(p))[2] = (uint8_t)(((op2) << 4) | (op1));             \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_add(p, r, s, t) emit_rrr((p), LX7_OP2_ADD, 0, (r), (s), (t))
+#define emit_sub(p, r, s, t) emit_rrr((p), LX7_OP2_SUB, 0, (r), (s), (t))
+#define emit_and(p, r, s, t) emit_rrr((p), LX7_OP2_AND, 0, (r), (s), (t))
+#define emit_or(p, r, s, t)  emit_rrr((p), LX7_OP2_OR,  0, (r), (s), (t))
+#define emit_xor(p, r, s, t) emit_rrr((p), LX7_OP2_XOR, 0, (r), (s), (t))
+#define emit_neg(p, r, t)    emit_rrr((p), LX7_OP2_NEG, 0, (r), 0, (t))
+#define emit_ssl(p, s)       emit_rrr((p), 0x4, 0x0, 1, (s), 0)
+#define emit_ssr(p, s)       emit_rrr((p), 0x4, 0x0, 0, (s), 0)
+#define emit_sll(p, r, s)    emit_rrr((p), LX7_OP2_SLL, 0x1, (r), (s), 0)
+#define emit_srl(p, r, t)    emit_rrr((p), LX7_OP2_SRL, 0x1, (r), 0, (t))
+#define emit_sra(p, r, t)    emit_rrr((p), LX7_OP2_SRA, 0x1, (r), 0, (t))
+
+#define emit_mov(p, r, s) do {                              \
+    (*(p))[0] = (uint8_t)(((r) << 4) | 0x0d);                \
+    (*(p))[1] = (uint8_t)(s);                                \
+    *(p) += 2;                                               \
+} while (0)
+
+#define emit_slli(p, r, s, sa) do {                         \
+    int _emit_n = 32 - ((sa) & 31);                          \
+    (*(p))[0] = (uint8_t)((_emit_n & 0x0F) << 4);            \
+    (*(p))[1] = (uint8_t)(((r) << 4) | (s));                 \
+    (*(p))[2] = (uint8_t)(((_emit_n >> 4) << 4) | 0x01);     \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_srli(p, r, t, sa) do {                         \
+    (*(p))[0] = (uint8_t)((t) << 4);                         \
+    (*(p))[1] = (uint8_t)(((r) << 4) | ((sa) & 0x0F));       \
+    (*(p))[2] = 0x41;                                        \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_srai(p, r, t, sa) do {                         \
+    (*(p))[0] = (uint8_t)((t) << 4);                         \
+    (*(p))[1] = (uint8_t)(((r) << 4) | ((sa) & 0x0F));       \
+    (*(p))[2] = (uint8_t)(((sa) & 0x10) ? 0x31 : 0x21);      \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_rri8(p, op_sub, t, s, op0, imm8) do {          \
+    (*(p))[0] = (uint8_t)(((t) << 4) | (op0));               \
+    (*(p))[1] = (uint8_t)(((op_sub) << 4) | (s));            \
+    (*(p))[2] = (uint8_t)((imm8) & 0xFF);                    \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_addi(p, t, s, imm8) emit_rri8((p), 0xC, (t), (s), 0x2, (imm8))
+#define emit_l32i(p, t, s, off8) emit_rri8((p), 0x2, (t), (s), 0x2, (off8))
+#define emit_s32i(p, t, s, off8) emit_rri8((p), 0x6, (t), (s), 0x2, (off8))
+#define emit_beq(p, s, t, off8)  emit_rri8((p), 0x1, (t), (s), 0x7, (off8))
+#define emit_bne(p, s, t, off8)  emit_rri8((p), 0x9, (t), (s), 0x7, (off8))
+#define emit_blt(p, s, t, off8)  emit_rri8((p), 0x2, (t), (s), 0x7, (off8))
+#define emit_bge(p, s, t, off8)  emit_rri8((p), 0xA, (t), (s), 0x7, (off8))
+#define emit_bltu(p, s, t, off8) emit_rri8((p), 0x3, (t), (s), 0x7, (off8))
+#define emit_bgeu(p, s, t, off8) emit_rri8((p), 0xB, (t), (s), 0x7, (off8))
+
+#define emit_beqz(p, s, imm12) do {                         \
+    (*(p))[0] = 0x16;                                        \
+    (*(p))[1] = (uint8_t)((((imm12) & 0xF) << 4) | (s));     \
+    (*(p))[2] = (uint8_t)(((imm12) >> 4) & 0xFF);            \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_bnez(p, s, imm12) do {                         \
+    (*(p))[0] = 0x56;                                        \
+    (*(p))[1] = (uint8_t)((((imm12) & 0xF) << 4) | (s));     \
+    (*(p))[2] = (uint8_t)(((imm12) >> 4) & 0xFF);            \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_bltz(p, s, imm12) do {                         \
+    (*(p))[0] = 0x96;                                        \
+    (*(p))[1] = (uint8_t)((((imm12) & 0xF) << 4) | (s));     \
+    (*(p))[2] = (uint8_t)(((imm12) >> 4) & 0xFF);            \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_bgez(p, s, imm12) do {                         \
+    (*(p))[0] = 0xD6;                                        \
+    (*(p))[1] = (uint8_t)((((imm12) & 0xF) << 4) | (s));     \
+    (*(p))[2] = (uint8_t)(((imm12) >> 4) & 0xFF);            \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_movi(p, t, imm12) do {                         \
+    (*(p))[0] = (uint8_t)(((t) << 4) | 0x2);                 \
+    (*(p))[1] = (uint8_t)(0xA0 | (((imm12) >> 8) & 0xF));    \
+    (*(p))[2] = (uint8_t)((imm12) & 0xFF);                   \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_j(p, off18) do {                               \
+    uint32_t _emit_enc =                                    \
+        (uint32_t)(((uint32_t)(off18) & 0x3FFFF) << 6) | 0x06u; \
+    (*(p))[0] = (uint8_t)(_emit_enc & 0xFF);                 \
+    (*(p))[1] = (uint8_t)((_emit_enc >> 8) & 0xFF);          \
+    (*(p))[2] = (uint8_t)((_emit_enc >> 16) & 0xFF);         \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_j_target(p, target) do {                       \
+    const uint8_t *_emit_pc = *(p);                          \
+    emit_j((p), (int32_t)((target) - (_emit_pc + 4)));       \
+} while (0)
+
+#define call8_target_reachable(pc, target) ({                \
+    intptr_t _emit_base = ((intptr_t)(pc) + 4) & ~(intptr_t)3; \
+    intptr_t _emit_delta = (intptr_t)(target) - _emit_base;  \
+    int32_t _emit_off = (int32_t)(_emit_delta >> 2);         \
+    ((_emit_delta & 3) == 0) && _emit_off >= -131072 &&      \
+        _emit_off <= 131071;                                \
+})
+
+#define emit_callx8(p, s) do {                              \
+    (*(p))[0] = 0xe0;                                        \
+    (*(p))[1] = (uint8_t)(s);                                \
+    (*(p))[2] = 0x00;                                        \
+    *(p) += 3;                                               \
+} while (0)
+
+#define emit_retw(p) do {                                   \
+    (*(p))[0] = 0x1D;                                        \
+    (*(p))[1] = 0xF0;                                        \
+    *(p) += 2;                                               \
+} while (0)
+
+#define emit_entry32(p) do {                                \
+    (*(p))[0] = 0x36;                                        \
+    (*(p))[1] = 0x41;                                        \
+    (*(p))[2] = 0x00;                                        \
+    *(p) += 3;                                               \
+} while (0)
+
 /* ---- Load a 32-bit literal via L32R ----------------------------- */
 /*
  * L32R at, imm16 (word offset from aligned PC)
@@ -527,7 +669,7 @@ static inline void emit_entry32(EmitPtr *p)
  * LX7 accepts this backward literal form; forward inline literals were
  * observed to assemble out of range on the ESP32-S3 toolchain.
  */
-static int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
+static IRAM_ATTR int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
 {
     uint8_t *start = *p;
 
@@ -589,7 +731,7 @@ static int emit_movi32(EmitPtr *p, int t, uint32_t imm32)
 #define NEXT_IP_OFF (8 * 4 + 4)         /* gprx[8]*4 bytes + ip(4) = 36 */
 
 /* Emit prologue: ENTRY + load only x86 GPRs read by this block. */
-static void emit_prologue(EmitPtr *p, int cpu_reg, uint8_t load_mask)
+static IRAM_ATTR void emit_prologue(EmitPtr *p, int cpu_reg, uint8_t load_mask)
 {
     emit_entry32(p);
     for (int i = 0; i < 8; i++) {
@@ -601,7 +743,7 @@ static void emit_prologue(EmitPtr *p, int cpu_reg, uint8_t load_mask)
 }
 
 /* Emit epilogue: store modified x86 GPRs back, set next_ip, RETW.N */
-static void emit_epilogue(EmitPtr *p, int cpu_reg, uint32_t next_ip, uint8_t store_mask)
+static IRAM_ATTR void emit_epilogue(EmitPtr *p, int cpu_reg, uint32_t next_ip, uint8_t store_mask)
 {
     for (int i = 0; i < 8; i++) {
         if (!(store_mask & (1u << i)))
@@ -614,8 +756,8 @@ static void emit_epilogue(EmitPtr *p, int cpu_reg, uint32_t next_ip, uint8_t sto
     emit_retw(p);
 }
 
-static bool emit_linked_exit(EmitPtr *p, const uint8_t *code_end, int cpu_reg,
-                             const JITBlock *target, uint8_t store_mask)
+static IRAM_ATTR bool emit_linked_exit(EmitPtr *p, const uint8_t *code_end, int cpu_reg,
+                                       const JITBlock *target, uint8_t store_mask)
 {
     int store_count = 0;
 
@@ -650,7 +792,7 @@ static bool emit_linked_exit(EmitPtr *p, const uint8_t *code_end, int cpu_reg,
     return true;
 }
 
-static void emit_store_gprs(EmitPtr *p, int cpu_reg, uint8_t store_mask)
+static IRAM_ATTR void emit_store_gprs(EmitPtr *p, int cpu_reg, uint8_t store_mask)
 {
     for (int i = 0; i < 8; i++) {
         if (store_mask & (1u << i))
@@ -658,7 +800,7 @@ static void emit_store_gprs(EmitPtr *p, int cpu_reg, uint8_t store_mask)
     }
 }
 
-static void emit_load_gprs(EmitPtr *p, int cpu_reg, uint8_t load_mask)
+static IRAM_ATTR void emit_load_gprs(EmitPtr *p, int cpu_reg, uint8_t load_mask)
 {
     for (int i = 0; i < 8; i++) {
         if (load_mask & (1u << i))
@@ -763,7 +905,7 @@ typedef struct {
     bool has_index;
 } MemOp;
 
-static inline ModRM decode_modrm(uint8_t b)
+static inline IRAM_ATTR ModRM decode_modrm(uint8_t b)
 {
     ModRM m;
     m.mod      = (b >> 6) & 3;
@@ -773,7 +915,7 @@ static inline ModRM decode_modrm(uint8_t b)
     return m;
 }
 
-static bool decode_simple_memop(const uint8_t *src, const ModRM *m, MemOp *mem)
+static IRAM_ATTR bool decode_simple_memop(const uint8_t *src, const ModRM *m, MemOp *mem)
 {
     int len = 0;
     int32_t disp = 0;
@@ -946,7 +1088,7 @@ static const char *jit_action_name(ActionType type)
     }
 }
 
-static void jit_action_reg_masks(const X86Action *a, uint8_t *read_mask, uint8_t *write_mask)
+static IRAM_ATTR void jit_action_reg_masks(const X86Action *a, uint8_t *read_mask, uint8_t *write_mask)
 {
     int dst_reg = a->dst & 7;
     int src_reg = a->src & 7;
@@ -1063,8 +1205,8 @@ static void jit_action_reg_masks(const X86Action *a, uint8_t *read_mask, uint8_t
     }
 }
 
-static void jit_actions_reg_masks(const X86Action *actions, int count,
-                                  uint8_t *load_mask, uint8_t *store_mask)
+static IRAM_ATTR void jit_actions_reg_masks(const X86Action *actions, int count,
+                                            uint8_t *load_mask, uint8_t *store_mask)
 {
     uint8_t read_mask = 0;
     uint8_t write_mask = 0;
@@ -1083,7 +1225,7 @@ static void jit_actions_reg_masks(const X86Action *actions, int count,
  * action   = output
  * Returns number of bytes consumed, or 0 if unhandled/unsupported.
  */
-static int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
+static IRAM_ATTR int decode_x86_insn(const uint8_t *src, uint32_t eip, X86Action *a)
 {
     int len = 0;
     memset(a, 0, sizeof(*a));
@@ -1436,7 +1578,7 @@ typedef struct {
     int      cmp_tmp;   /* LX7 register holding (lreg - imm) for mode 2 */
 } CmpState;
 
-static void emit_mem_address(EmitPtr *p, const X86Action *a, int dst, int tmp)
+static IRAM_ATTR void emit_mem_address(EmitPtr *p, const X86Action *a, int dst, int tmp)
 {
     if (a->mem_base >= 0) {
         emit_mov(p, dst, X86REG_TO_LX7(a->mem_base));
@@ -1457,16 +1599,16 @@ static void emit_mem_address(EmitPtr *p, const X86Action *a, int dst, int tmp)
     }
 }
 
-static void emit_guest_ptr32(EmitPtr *p, const X86Action *a,
-                             int cpu_reg, int addr_reg,
-                             int tmp_reg, int ptr_reg)
+static IRAM_ATTR void emit_guest_ptr32(EmitPtr *p, const X86Action *a,
+                                       int cpu_reg, int addr_reg,
+                                       int tmp_reg, int ptr_reg)
 {
     emit_mem_address(p, a, addr_reg, tmp_reg);
     emit_l32i(p, ptr_reg, cpu_reg, JIT_PHYS_MEM_OFF / 4);
     emit_add(p, ptr_reg, ptr_reg, addr_reg);
 }
 
-static void emit_merge_u8(EmitPtr *p, int dst_reg, int value_reg, int tmp_reg, bool high)
+static IRAM_ATTR void emit_merge_u8(EmitPtr *p, int dst_reg, int value_reg, int tmp_reg, bool high)
 {
     uint32_t clear_mask = high ? 0xffff00ffu : 0xffffff00u;
 
@@ -1479,7 +1621,7 @@ static void emit_merge_u8(EmitPtr *p, int dst_reg, int value_reg, int tmp_reg, b
     emit_or(p, dst_reg, dst_reg, value_reg);
 }
 
-static void emit_merge_u16(EmitPtr *p, int dst_reg, int value_reg, int tmp_reg)
+static IRAM_ATTR void emit_merge_u16(EmitPtr *p, int dst_reg, int value_reg, int tmp_reg)
 {
     emit_movi32(p, tmp_reg, 0xffff0000u);
     emit_and(p, dst_reg, dst_reg, tmp_reg);
@@ -1492,10 +1634,10 @@ static void emit_merge_u16(EmitPtr *p, int dst_reg, int value_reg, int tmp_reg)
  * emit_action — translate one action.
  * Returns false if code buffer would overflow (host_len >= JIT_BLOCK_MAXBYTES).
  */
-static bool emit_action(EmitPtr *p, uint8_t *buf_end,
-                         const X86Action *a, CmpState *cs,
-                         uint32_t fallback_eip, int cpu_reg,
-                         uint8_t load_mask, uint8_t store_mask)
+static IRAM_ATTR bool emit_action(EmitPtr *p, uint8_t *buf_end,
+                                  const X86Action *a, CmpState *cs,
+                                  uint32_t fallback_eip, int cpu_reg,
+                                  uint8_t load_mask, uint8_t store_mask)
 {
 #define GUARD(n) if ((*p) + (n) > buf_end) return false
 
@@ -2554,7 +2696,7 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
     jit_dump_unsupported_opcodes(jit);
 }
 
-static bool jit_action_uses_helper(const X86Action *a)
+static IRAM_ATTR bool jit_action_uses_helper(const X86Action *a)
 {
     switch (a->type) {
     case ACT_MOV_RM32:
@@ -2575,7 +2717,7 @@ static bool jit_action_uses_helper(const X86Action *a)
     }
 }
 
-static uint16_t jit_block_flags_for_actions(const X86Action *actions, int count)
+static IRAM_ATTR uint16_t jit_block_flags_for_actions(const X86Action *actions, int count)
 {
     if (count <= 0)
         return JIT_BLOCKF_NONE;
@@ -2590,7 +2732,7 @@ static uint16_t jit_block_flags_for_actions(const X86Action *actions, int count)
     }
 }
 
-static JITExitKind jit_exit_kind_for_actions(const X86Action *actions, int count)
+static IRAM_ATTR JITExitKind jit_exit_kind_for_actions(const X86Action *actions, int count)
 {
     if (count <= 0)
         return JIT_EXIT_UNKNOWN;
@@ -2620,7 +2762,7 @@ static JITBlock *jit_find_link_target(JITState *jit, uint32_t paddr,
     return target;
 }
 
-static bool jit_action_ends_block(const X86Action *a)
+static IRAM_ATTR bool jit_action_ends_block(const X86Action *a)
 {
     return a->type == ACT_JMP || a->type == ACT_JCC || a->type == ACT_BLOCK_END;
 }
@@ -2635,7 +2777,7 @@ void jit_selftest_clear_allowed_actions(void)
     s_jit_selftest_allow = 0;
 }
 
-static bool jit_action_enabled(const X86Action *a, int block_insn_index)
+static IRAM_ATTR bool jit_action_enabled(const X86Action *a, int block_insn_index)
 {
     /*
      * JIT bring-up status on ESP32-S3 / COM19, 2026-06-28:

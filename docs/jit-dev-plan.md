@@ -1268,3 +1268,11 @@ Task 1.1 判定：通过。后续任务可以在这个 ABI/编码基线之上继
 - Experimental `TINY386_JIT_ENABLE_STACK_FASTPATH=1` was added for direct `PUSH imm8` stack stores. Stack-fastpath-only failed the DOS phase twice: captures reached the boot sector but not VGA1 or DOSBENCH, while repeatedly translating and invalidating blocks (`hits/translations/invalidations` climbed into the hundreds of thousands). The unsafe shortcut skips SS base, stack mask/limit, page/MMIO behavior, and SMC store semantics. It remains default-off and should not be used as the next performance path without a safer segmented stack address model.
 
 - P7 decision after high-risk gate bisect: keep default firmware conservative (`MEM_HELPERS=0`, `INLINE_MEM=0`, `STACK_FASTPATH=0`, `PUSH_IMM8=0`). Inline memory is a usable experiment switch but not yet a win. Stack fast path is the current correctness hazard. The next useful optimization is reducing lookup/fallback tax and increasing translated coverage with safe stack semantics, not bypassing memory helpers globally.
+
+## 2026-07-02 Execution Record (P7 IRAM emitter/macro probe)
+
+- Implementation probe: converted the LX7 byte-emitter hot helpers from inline functions to macro expansion and moved translation/emission hot functions into IRAM, including `decode_x86_insn`, `emit_action`, `jit_action_enabled`, `emit_movi32`, addressing helpers, and GPR save/load emitters. `jit_translate` was already in IRAM.
+
+- Build and board result: `build_dosbench_l3_iram_macro` built and flashed on COM19, then ran three 90s DOSBENCH captures without panic/WDT. The phase result was effectively unchanged: VGA3->VGA1 `19877`, `19880`, `19878 ms` versus the previous default level3 mean `19877.7 ms`. DOSBENCH ticks stayed in noise range: ALU `323`, BRANCH `289`, STACK `40-41`, MEM `2-3`, SMC `0-1`.
+
+- Counter result: this does reduce translation-side cost, but not enough to affect the workload. Mean `translate_cycles` dropped from about `114750` to `65031`, and `guest_scan_cycles` from about `43382` to `8208`; however `lookup_cycles` stayed around `21M` per capture and dominates the remaining JIT tax. Conclusion: keep the change as a low-risk translation-cost cleanup, but the next performance work still needs lower lookup/fallback pressure or more useful translated coverage.
