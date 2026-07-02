@@ -2580,12 +2580,34 @@ static void jit_dump_stats(const JITState *jit)
                    (unsigned)jit->helper_call_actions,
                    (unsigned)jit->host_buffer_full,
                    (unsigned)jit->pool_flushes);
+    esp_rom_printf("[jit_stats] miss_nojit_table=%u miss_sticky_block=%u "
+                   "miss_hot_skip=%u miss_translate_bail=%u "
+                   "cache_empty=%u cache_conflict=%u cache_nojit_slot=%u "
+                   "cache_other_slot=%u\n",
+                   (unsigned)jit->miss_nojit_table,
+                   (unsigned)jit->miss_sticky_block,
+                   (unsigned)jit->miss_hot_skip,
+                   (unsigned)jit->miss_translate_bail,
+                   (unsigned)jit->cache_empty_slot_misses,
+                   (unsigned)jit->cache_conflict_misses,
+                   (unsigned)jit->cache_nojit_slot_misses,
+                   (unsigned)jit->cache_other_slot_misses);
     esp_rom_printf("[jit_stats] smc_bitmap_misses=%u smc_scans=%u "
                    "smc_false_positives=%u smc_overlap_invalidations=%u\n",
                    (unsigned)jit->smc_bitmap_misses,
                    (unsigned)jit->smc_scans,
                    (unsigned)jit->smc_false_positives,
                    (unsigned)jit->smc_overlap_invalidations);
+    esp_rom_printf("[jit_stats] smc_valid_blocks_scanned=%u "
+                   "smc_blocks_invalidated=%u cache_conflict_invalidations=%u "
+                   "full_flushes=%u full_flush_invalidations=%u "
+                   "pool_full_invalidations=%u\n",
+                   (unsigned)jit->smc_valid_blocks_scanned,
+                   (unsigned)jit->smc_blocks_invalidated,
+                   (unsigned)jit->cache_conflict_invalidations,
+                   (unsigned)jit->full_flushes,
+                   (unsigned)jit->full_flush_invalidations,
+                   (unsigned)jit->pool_full_invalidations);
     esp_rom_printf("[jit_stats] try_entries=%u block_entries=%u "
                    "block_exits=%u interp_exits=%u try_cycles=%llu "
                    "lookup_cycles=%llu translate_cycles=%llu "
@@ -2643,12 +2665,20 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
                    "step_count=%u step_batch=%u jit_hits=%u jit_misses=%u "
                    "cache_misses=%u translate_attempts=%u translated=%u "
                    "bailed=%u sticky_nojit=%u nojit_sets=%u hot_skips=%u "
+                   "miss_nojit_table=%u miss_sticky_block=%u "
+                   "miss_hot_skip=%u miss_translate_bail=%u "
+                   "cache_empty=%u cache_conflict=%u cache_nojit_slot=%u "
+                   "cache_other_slot=%u "
                    "jit_guest_insns=%u "
                    "jit_guest_delta=%u "
                    "jit_guest_pct=%u host_buffer_full=%u pool_epoch=%u "
                    "pool_flushes=%u smc_flushes=%u invalidations=%u "
                    "smc_bitmap_misses=%u smc_scans=%u "
                    "smc_false_positives=%u smc_overlap_invalidations=%u "
+                   "smc_valid_blocks_scanned=%u smc_blocks_invalidated=%u "
+                   "cache_conflict_invalidations=%u "
+                   "full_flushes=%u full_flush_invalidations=%u "
+                   "pool_full_invalidations=%u "
                    "linked_exits=%u helper_actions=%u emitted_x86_bytes=%u "
                    "emitted_host_bytes=%u unsupported_total=%u "
                    "try_entries=%u block_entries=%u block_exits=%u "
@@ -2669,6 +2699,14 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
                    (unsigned)jit->sticky_nojit_hits,
                    (unsigned)jit->nojit_table_sets,
                    (unsigned)jit->hot_threshold_skips,
+                   (unsigned)jit->miss_nojit_table,
+                   (unsigned)jit->miss_sticky_block,
+                   (unsigned)jit->miss_hot_skip,
+                   (unsigned)jit->miss_translate_bail,
+                   (unsigned)jit->cache_empty_slot_misses,
+                   (unsigned)jit->cache_conflict_misses,
+                   (unsigned)jit->cache_nojit_slot_misses,
+                   (unsigned)jit->cache_other_slot_misses,
                    (unsigned)jit->jit_guest_insns,
                    (unsigned)jit_guest_delta,
                    (unsigned)jit_pct,
@@ -2681,6 +2719,12 @@ void jit_dump_perf_snapshot(JITState *jit, const char *phase,
                    (unsigned)jit->smc_scans,
                    (unsigned)jit->smc_false_positives,
                    (unsigned)jit->smc_overlap_invalidations,
+                   (unsigned)jit->smc_valid_blocks_scanned,
+                   (unsigned)jit->smc_blocks_invalidated,
+                   (unsigned)jit->cache_conflict_invalidations,
+                   (unsigned)jit->full_flushes,
+                   (unsigned)jit->full_flush_invalidations,
+                   (unsigned)jit->pool_full_invalidations,
                    (unsigned)jit->linked_exits,
                    (unsigned)jit->helper_call_actions,
                    (unsigned)jit->emitted_x86_bytes,
@@ -2926,9 +2970,12 @@ void jit_init(JITState *jit, uint8_t *iram_pool)
 
 void jit_invalidate_all(JITState *jit)
 {
+    jit->full_flushes++;
     for (int i = 0; i < JIT_CACHE_ENTRIES; i++) {
-        if (jit->blocks[i].status == JIT_VALID)
+        if (jit->blocks[i].status == JIT_VALID) {
             jit->invalidations++;
+            jit->full_flush_invalidations++;
+        }
         jit->blocks[i].status = JIT_EMPTY;
     }
     jit->pool_used = 0;
@@ -2936,15 +2983,18 @@ void jit_invalidate_all(JITState *jit)
     memset(jit->smc_page_bitmap, 0, sizeof(jit->smc_page_bitmap));
 }
 
-static void jit_invalidate_slot_and_links(JITState *jit, uint16_t slot)
+static uint32_t jit_invalidate_slot_and_links(JITState *jit, uint16_t slot)
 {
+    uint32_t invalidated = 0;
+
     if (slot >= JIT_CACHE_ENTRIES)
-        return;
+        return 0;
 
     JITBlock *victim = &jit->blocks[slot];
     if (victim->status == JIT_VALID) {
         victim->status = JIT_EMPTY;
         jit->invalidations++;
+        invalidated++;
     }
 
     for (uint16_t i = 0; i < JIT_CACHE_ENTRIES; i++) {
@@ -2955,8 +3005,10 @@ static void jit_invalidate_slot_and_links(JITState *jit, uint16_t slot)
             block->link_slot == slot) {
             block->status = JIT_EMPTY;
             jit->invalidations++;
+            invalidated++;
         }
     }
+    return invalidated;
 }
 
 static inline uint32_t jit_smc_page_bit(uint32_t paddr)
@@ -3015,9 +3067,11 @@ void jit_invalidate_range(JITState *jit, uint32_t paddr, uint32_t size)
         if (block->status != JIT_VALID)
             continue;
 
+        jit->smc_valid_blocks_scanned++;
         if (block->guest_paddr < range_end && block->guest_end > paddr) {
             overlapped = true;
-            jit_invalidate_slot_and_links(jit, (uint16_t)i);
+            jit->smc_blocks_invalidated +=
+                jit_invalidate_slot_and_links(jit, (uint16_t)i);
         }
     }
     if (overlapped)
@@ -3099,15 +3153,20 @@ JITBlock *jit_translate(JITState *jit, CPUI386 *cpu)
     jit->guest_ptr_cycles += jit_cycles_since(guest_ptr_start);
 
     /* Evict the old entry if occupied by a different address */
-    if (block->status == JIT_VALID && block->guest_paddr != paddr)
-        jit_invalidate_slot_and_links(jit, (uint16_t)slot);
+    if (block->status == JIT_VALID && block->guest_paddr != paddr) {
+        jit->cache_conflict_invalidations +=
+            jit_invalidate_slot_and_links(jit, (uint16_t)slot);
+    }
 
     /* Allocate space in the code pool */
     jit->pool_used = jit_align4(jit->pool_used);
     if (jit->pool_used + JIT_BLOCK_MAXBYTES > JIT_POOL_SIZE) {
         /* Pool full: flush everything and restart */
+        uint32_t full_flush_invalidations_before = jit->full_flush_invalidations;
         jit->pool_flushes++;
         jit_invalidate_all(jit);
+        jit->pool_full_invalidations +=
+            jit->full_flush_invalidations - full_flush_invalidations_before;
     }
 
     uint8_t  *pool_raw = jit->pool + jit->pool_used;
@@ -3398,6 +3457,7 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     if (jit_nojit_lookup(jit, paddr, &nojit_bail)) {
         jit->misses++;
         jit->sticky_nojit_hits++;
+        jit->miss_nojit_table++;
         JIT_TRACEF("[jit_trace] nojit-table-hit paddr=0x%08x bail=%s\n",
                    (unsigned)paddr, jit_bail_reason_name(nojit_bail));
         jit_maybe_dump_stats(jit);
@@ -3411,6 +3471,7 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     if (block->status == JIT_NOJIT && block->guest_paddr == paddr) {
         jit->misses++;
         jit->sticky_nojit_hits++;
+        jit->miss_sticky_block++;
         JIT_TRACEF("[jit_trace] nojit-hit paddr=0x%08x bail=%s\n",
                    (unsigned)paddr, jit_bail_reason_name(block->bail));
         jit_maybe_dump_stats(jit);
@@ -3424,8 +3485,18 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
     if (block->status != JIT_VALID || block->guest_paddr != paddr) {
         /* Cache miss: translate */
         jit->cache_misses++;
+        if (block->status == JIT_EMPTY) {
+            jit->cache_empty_slot_misses++;
+        } else if (block->status == JIT_VALID) {
+            jit->cache_conflict_misses++;
+        } else if (block->status == JIT_NOJIT) {
+            jit->cache_nojit_slot_misses++;
+        } else {
+            jit->cache_other_slot_misses++;
+        }
         if (jit_hot_threshold_skip(jit, paddr)) {
             jit->misses++;
+            jit->miss_hot_skip++;
             jit_maybe_dump_stats(jit);
             jit->lookup_cycles += jit_cycles_since(lookup_start);
             jit->interp_exits++;
@@ -3444,6 +3515,7 @@ int jit_try_execute(JITState *jit, CPUI386 *cpu)
         jit->translate_cycles += jit_cycles_since(translate_start);
         if (!block) {
             jit->misses++;
+            jit->miss_translate_bail++;
             JIT_TRACEF("[jit_trace] miss-bail eip=0x%08x paddr=0x%08x\n",
                        (unsigned)eip, (unsigned)paddr);
             jit_maybe_dump_stats(jit);

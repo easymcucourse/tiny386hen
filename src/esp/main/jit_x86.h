@@ -356,7 +356,15 @@ typedef struct {
     uint32_t translate_attempts;
     uint32_t translated;
     uint32_t cache_misses;
+    uint32_t cache_empty_slot_misses;
+    uint32_t cache_conflict_misses;
+    uint32_t cache_nojit_slot_misses;
+    uint32_t cache_other_slot_misses;
     uint32_t sticky_nojit_hits;
+    uint32_t miss_nojit_table;
+    uint32_t miss_sticky_block;
+    uint32_t miss_hot_skip;
+    uint32_t miss_translate_bail;
     uint32_t nojit_table_sets;
     uint32_t hot_threshold_skips;
     uint32_t jit_guest_insns;
@@ -372,6 +380,12 @@ typedef struct {
     uint32_t smc_scans;
     uint32_t smc_false_positives;
     uint32_t smc_overlap_invalidations;
+    uint32_t smc_valid_blocks_scanned;
+    uint32_t smc_blocks_invalidated;
+    uint32_t cache_conflict_invalidations;
+    uint32_t full_flushes;
+    uint32_t full_flush_invalidations;
+    uint32_t pool_full_invalidations;
     uint32_t smc_page_bitmap[JIT_SMC_PAGE_WORDS]; /* Hashed pages with translated code. */
     JITNojitEntry nojit_table[JIT_NOJIT_ENTRIES];
     JITHotEntry hot_table[JIT_HOT_ENTRIES];
